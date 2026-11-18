@@ -1,0 +1,1285 @@
+package spdk
+
+import (
+	"context"
+	"fmt"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"github.com/sirupsen/logrus"
+
+	"google.golang.org/protobuf/types/known/emptypb"
+
+	grpccodes "google.golang.org/grpc/codes"
+	grpcstatus "google.golang.org/grpc/status"
+
+	"github.com/longhorn/go-spdk-helper/pkg/jsonrpc"
+	"github.com/longhorn/types/pkg/generated/spdkrpc"
+
+	commonbitmap "github.com/longhorn/go-common-libs/bitmap"
+	spdkclient "github.com/longhorn/go-spdk-helper/pkg/spdk/client"
+	spdktypes "github.com/longhorn/go-spdk-helper/pkg/spdk/types"
+
+	"github.com/longhorn/longhorn-spdk-engine/pkg/types"
+	"github.com/longhorn/longhorn-spdk-engine/pkg/util"
+	"github.com/longhorn/longhorn-spdk-engine/pkg/util/broadcaster"
+)
+
+const (
+	MonitorInterval = 3 * time.Second
+)
+
+type Server struct {
+	spdkrpc.UnimplementedSPDKServiceServer
+	sync.RWMutex
+
+	diskCreateLock sync.Mutex
+	hotplugActive  atomic.Bool // use atomic.Bool to avoid data races across goroutines.
+
+	// replicaMapGen is bumped (under Lock) every time replicaMap is mutated
+	// by ReplicaCreate or ReplicaDelete.  verify() captures it in
+	// newVerifyState and compares in applyVerifiedState to detect
+	// concurrent mutations and skip stale overwrites.
+	replicaMapGen int64
+	// shardMapGen does the same for shardMap (ShardCreate/ShardDelete).
+	shardMapGen int64
+	// shardGroupMapGen does the same for shardGroupMap
+	// (ShardGroupCreate/ShardGroupDelete).
+	shardGroupMapGen int64
+
+	ctx context.Context
+
+	spdkClient    *spdkclient.Client
+	portAllocator *commonbitmap.Bitmap
+
+	diskMap           map[string]*Disk
+	replicaMap        map[string]*Replica
+	engineMap         map[string]*Engine
+	engineFrontendMap map[string]*EngineFrontend
+
+	shardMap      map[string]*Shard
+	shardGroupMap map[string]*ShardGroup
+
+	backupMap map[string]*Backup
+
+	// We store BackingImage in each lvstore
+	backingImageMap map[string]*BackingImage
+
+	broadcasters map[types.InstanceType]*broadcaster.Broadcaster
+	broadcastChs map[types.InstanceType]chan interface{}
+	updateChs    map[types.InstanceType]chan interface{}
+
+	currentBdevIostat *spdktypes.BdevIostatResponse
+	bdevMetricMap     map[string]*spdkrpc.Metrics
+
+	// volumeHostLocksMu protects the volumeHostLocks map itself.
+	volumeHostLocksMu sync.Mutex
+	// volumeHostLocks serializes host-level NVMe/dm operations for the same
+	// volume. Recovery and all frontend lifecycle RPCs that mutate host
+	// NVMe controllers or dm devices (create, delete, suspend, resume,
+	// expand, switchover) acquire the per-volume lock so that these
+	// operations cannot overlap on one volume.
+	//
+	// Entries are reference-counted and removed when the last holder
+	// releases, so the map is bounded by the number of concurrently
+	// active volumes rather than growing monotonically.
+	volumeHostLocks map[string]*volumeHostLockEntry
+
+	// metadataDir is the base path for persisting engine frontend records
+	// (e.g. /var/lib/longhorn). If empty, persistence is disabled.
+	metadataDir string
+
+	newServiceClient ServiceClientFactory
+}
+
+func NewServer(ctx context.Context, portStart, portEnd int32, newServiceClient ServiceClientFactory) (*Server, error) {
+	if newServiceClient == nil {
+		newServiceClient = GetServiceClient
+	}
+
+	cli, err := spdkclient.NewClient(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	bitmap, err := commonbitmap.NewBitmap(portStart, portEnd)
+	if err != nil {
+		return nil, err
+	}
+
+	if _, err = cli.BdevNvmeSetOptions(
+		replicaCtrlrLossTimeoutSec,
+		replicaReconnectDelaySec,
+		replicaFastIOFailTimeoutSec,
+		replicaTransportAckTimeout,
+		replicaKeepAliveTimeoutMs); err != nil {
+		return nil, errors.Wrap(err, "failed to set NVMe options")
+	}
+
+	broadcasters := map[types.InstanceType]*broadcaster.Broadcaster{}
+	broadcastChs := map[types.InstanceType]chan interface{}{}
+	updateChs := map[types.InstanceType]chan interface{}{}
+	for _, t := range []types.InstanceType{types.InstanceTypeReplica, types.InstanceTypeEngine, types.InstanceTypeEngineFrontend, types.InstanceTypeBackingImage, types.InstanceTypeShard, types.InstanceTypeShardGroup} {
+		broadcasters[t] = &broadcaster.Broadcaster{}
+		broadcastChs[t] = make(chan interface{})
+		updateChs[t] = make(chan interface{})
+	}
+
+	s := &Server{
+		ctx: ctx,
+
+		hotplugActive: atomic.Bool{},
+
+		spdkClient:    cli,
+		portAllocator: bitmap,
+
+		diskMap: map[string]*Disk{},
+
+		replicaMap:        map[string]*Replica{},
+		engineMap:         map[string]*Engine{},
+		engineFrontendMap: map[string]*EngineFrontend{},
+
+		shardMap:      map[string]*Shard{},
+		shardGroupMap: map[string]*ShardGroup{},
+
+		backupMap: map[string]*Backup{},
+
+		backingImageMap: map[string]*BackingImage{},
+
+		broadcasters: broadcasters,
+		broadcastChs: broadcastChs,
+		updateChs:    updateChs,
+
+		volumeHostLocks: map[string]*volumeHostLockEntry{},
+
+		metadataDir:      types.MetadataDir,
+		newServiceClient: newServiceClient,
+	}
+	s.hotplugActive.Store(true)
+
+	if _, err := s.broadcasters[types.InstanceTypeReplica].Subscribe(ctx, s.replicaBroadcastConnector); err != nil {
+		return nil, err
+	}
+	if _, err := s.broadcasters[types.InstanceTypeEngine].Subscribe(ctx, s.engineBroadcastConnector); err != nil {
+		return nil, err
+	}
+	if _, err := s.broadcasters[types.InstanceTypeEngineFrontend].Subscribe(ctx, s.engineFrontendBroadcastConnector); err != nil {
+		return nil, err
+	}
+	if _, err := s.broadcasters[types.InstanceTypeBackingImage].Subscribe(ctx, s.backingImageBroadcastConnector); err != nil {
+		return nil, err
+	}
+	if _, err := s.broadcasters[types.InstanceTypeShard].Subscribe(ctx, s.shardBroadcastConnector); err != nil {
+		return nil, err
+	}
+	if _, err := s.broadcasters[types.InstanceTypeShardGroup].Subscribe(ctx, s.shardGroupBroadcastConnector); err != nil {
+		return nil, err
+	}
+
+	// Start broadcasting before recovery so that UpdateCh sends inside
+	// RecoverFromHost do not block on the unbuffered channel.
+	go s.broadcasting()
+
+	// Run engine frontend recovery asynchronously so that gRPC servers can
+	// start listening immediately. This prevents the liveness probe from
+	// killing the pod when recovery takes longer than the probe threshold
+	// (e.g. when persisted targets are unreachable).
+	go s.recoverEngineFrontends(ctx)
+
+	// TODO: There is no need to maintain the replica map in cache when we can use one SPDK JSON API call to fetch the Lvol tree/chain info
+	go s.monitoring()
+
+	return s, nil
+}
+
+func (s *Server) monitoring() {
+	ticker := time.NewTicker(MonitorInterval)
+	defer ticker.Stop()
+
+	done := false
+	for {
+		select {
+		case <-s.ctx.Done():
+			logrus.Info("spdk gRPC server: stopped monitoring replicas due to the context done")
+			done = true
+		case <-ticker.C:
+			err := s.verify()
+			if err == nil {
+				break
+			}
+
+			logrus.WithError(err).Errorf("spdk gRPC server: failed to verify and update replica cache, will retry later")
+
+			if jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) || jsonrpc.IsJSONRPCRespErrorInvalidCharacter(err) {
+				err = s.tryEnsureSPDKTgtConnectionHealthy()
+				if err != nil {
+					logrus.WithError(err).Error("spdk gRPC server: failed to ensure spdk_tgt connection healthy")
+				}
+			}
+		}
+		if done {
+			break
+		}
+	}
+}
+
+func (s *Server) tryEnsureSPDKTgtConnectionHealthy() error {
+	running, err := util.IsSPDKTargetProcessRunning()
+	if err != nil {
+		return errors.Wrap(err, "failed to check spdk_tgt is running")
+	}
+	if !running {
+		return errors.New("spdk_tgt is not running")
+	}
+
+	logrus.Info("spdk gRPC server: reconnecting to spdk_tgt")
+	return s.clientReconnect()
+}
+
+func (s *Server) clientReconnect() error {
+	s.Lock()
+	defer func() {
+		s.Unlock()
+	}()
+
+	oldClient := s.spdkClient
+
+	client, err := spdkclient.NewClient(s.ctx)
+	if err != nil {
+		return errors.Wrap(err, "failed to create new SPDK client")
+	}
+	s.spdkClient = client
+
+	// Try the best effort to close the old client after a new client is created
+	err = oldClient.Close()
+	if err != nil {
+		logrus.WithError(err).Warn("Failed to close old SPDK client")
+	}
+	return nil
+}
+
+type verifyState struct {
+	replicaMap            map[string]*Replica
+	replicaMapGen         int64
+	replicaMapForSync     map[string]*Replica
+	engineMapForSync      map[string]*Engine
+	engineFrontendForSync map[string]*EngineFrontend
+	backingImageMap       map[string]*BackingImage
+	backingImageForSync   map[string]*BackingImage
+	shardMap              map[string]*Shard
+	shardMapGen           int64
+	shardMapForSync       map[string]*Shard
+	shardGroupMap         map[string]*ShardGroup
+	shardGroupMapGen      int64
+	shardGroupMapForSync  map[string]*ShardGroup
+	spdkClient            *spdkclient.Client
+}
+
+func (s *Server) verify() (err error) {
+	s.Lock()
+	state := s.newVerifyState()
+	s.trySelfHealHotplug()
+	s.Unlock()
+
+	defer func() {
+		s.handleVerifyError(err, state)
+	}()
+
+	// rebuildCachedLvolObjects makes SPDK JSON-RPC calls that may block
+	// for a long time (e.g. when spdk_tgt is busy with blobstore
+	// recovery during DiskCreate).  Run it WITHOUT the server lock so
+	// that gRPC handlers (EngineGet, EngineFrontendCreate, …) are not
+	// starved.
+	if err = s.rebuildCachedLvolObjects(state); err != nil {
+		return err
+	}
+
+	if !s.applyVerifiedState(state) {
+		return nil
+	}
+
+	return s.syncVerifiedObjects(state)
+}
+
+func (s *Server) applyVerifiedState(state *verifyState) bool {
+	s.Lock()
+	defer s.Unlock()
+
+	if s.replicaMapGen != state.replicaMapGen {
+		logrus.Infof("spdk gRPC server: skipped replica map update due to concurrent replica mutation during verify")
+		s.backingImageMap = state.backingImageMap
+		s.UpdateEngineMetrics()
+		return false
+	}
+
+	if s.shardMapGen != state.shardMapGen {
+		logrus.Infof("spdk gRPC server: skipped map update due to concurrent shard mutation during verify")
+		s.backingImageMap = state.backingImageMap
+		s.UpdateEngineMetrics()
+		return false
+	}
+
+	if s.shardGroupMapGen != state.shardGroupMapGen {
+		logrus.Infof("spdk gRPC server: skipped map update due to concurrent shardgroup mutation during verify")
+		s.backingImageMap = state.backingImageMap
+		s.UpdateEngineMetrics()
+		return false
+	}
+
+	if len(s.replicaMap) != len(state.replicaMap) {
+		logrus.Infof("spdk gRPC server: replica map updated, map count is changed from %d to %d", len(s.replicaMap), len(state.replicaMap))
+	}
+
+	s.replicaMap = state.replicaMap
+	s.backingImageMap = state.backingImageMap
+	s.shardMap = state.shardMap
+	s.shardGroupMap = state.shardGroupMap
+	s.UpdateEngineMetrics()
+	return true
+}
+
+func (s *Server) newVerifyState() *verifyState {
+	state := &verifyState{
+		replicaMap:            map[string]*Replica{},
+		replicaMapGen:         s.replicaMapGen,
+		replicaMapForSync:     map[string]*Replica{},
+		engineMapForSync:      map[string]*Engine{},
+		engineFrontendForSync: map[string]*EngineFrontend{},
+		backingImageMap:       map[string]*BackingImage{},
+		backingImageForSync:   map[string]*BackingImage{},
+		shardMap:              map[string]*Shard{},
+		shardMapGen:           s.shardMapGen,
+		shardMapForSync:       map[string]*Shard{},
+		shardGroupMap:         map[string]*ShardGroup{},
+		shardGroupMapGen:      s.shardGroupMapGen,
+		shardGroupMapForSync:  map[string]*ShardGroup{},
+		spdkClient:            s.spdkClient,
+	}
+
+	for k, v := range s.replicaMap {
+		state.replicaMap[k] = v
+		state.replicaMapForSync[k] = v
+	}
+	for k, v := range s.engineMap {
+		state.engineMapForSync[k] = v
+	}
+	for k, v := range s.engineFrontendMap {
+		state.engineFrontendForSync[k] = v
+	}
+	for k, v := range s.backingImageMap {
+		state.backingImageMap[k] = v
+		state.backingImageForSync[k] = v
+	}
+	for k, v := range s.shardMap {
+		state.shardMap[k] = v
+		state.shardMapForSync[k] = v
+	}
+	for k, v := range s.shardGroupMap {
+		state.shardGroupMap[k] = v
+		state.shardGroupMapForSync[k] = v
+	}
+	return state
+}
+
+func (s *Server) handleVerifyError(err error, state *verifyState) {
+	if err == nil {
+		return
+	}
+	if jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+		logrus.WithError(err).Warn("spdk gRPC server: marking all non-stopped and non-error replicas, engines, shards, and shardgroups as error")
+		for _, r := range state.replicaMapForSync {
+			r.SetErrorState()
+		}
+		for _, e := range state.engineMapForSync {
+			e.SetErrorState()
+		}
+		for _, ef := range state.engineFrontendForSync {
+			ef.SetErrorState()
+		}
+		for _, sh := range state.shardMapForSync {
+			sh.SetErrorState()
+		}
+		for _, sg := range state.shardGroupMapForSync {
+			sg.SetErrorState()
+		}
+	}
+}
+
+func (s *Server) trySelfHealHotplug() {
+	// Self-heal: re-enable hotplug only if no disks are being created and the last enablement failed.
+	isDiskCreating := false
+	for _, disk := range s.diskMap {
+		if disk.GetState() == DiskStateCreating {
+			isDiskCreating = true
+			break
+		}
+	}
+	if !isDiskCreating && !s.hotplugActive.Load() {
+		if success := setNvmeHotPlug(s.spdkClient, true); success {
+			s.hotplugActive.Store(true)
+		}
+	}
+}
+
+func buildBdevLvolMap(bdevList []spdktypes.BdevInfo) map[string]*spdktypes.BdevInfo {
+	bdevLvolMap := map[string]*spdktypes.BdevInfo{}
+	for idx := range bdevList {
+		bdev := &bdevList[idx]
+		if spdktypes.GetBdevType(bdev) != spdktypes.BdevTypeLvol {
+			continue
+		}
+		if len(bdev.Aliases) != 1 {
+			continue
+		}
+		bdevLvolMap[spdktypes.GetLvolNameFromAlias(bdev.Aliases[0])] = bdev
+	}
+	return bdevLvolMap
+}
+
+func buildLvsUUIDNameMap(lvsList []spdktypes.LvstoreInfo) map[string]string {
+	lvsUUIDNameMap := map[string]string{}
+	for _, lvs := range lvsList {
+		lvsUUIDNameMap[lvs.UUID] = lvs.Name
+	}
+	return lvsUUIDNameMap
+}
+
+func (s *Server) rebuildCachedLvolObjects(state *verifyState) error {
+	bdevList, err := state.spdkClient.BdevGetBdevs("", 0)
+	if err != nil {
+		return err
+	}
+	bdevLvolMap := buildBdevLvolMap(bdevList)
+
+	lvsList, err := state.spdkClient.BdevLvolGetLvstore("", "")
+	if err != nil {
+		return err
+	}
+	lvsUUIDNameMap := buildLvsUUIDNameMap(lvsList)
+
+	// Detect if the lvol bdev is an uncached replica or backing image.
+	for lvolName, bdevLvol := range bdevLvolMap {
+		if bdevLvol.DriverSpecific.Lvol.Snapshot && !types.IsBackingImageSnapLvolName(lvolName) {
+			continue
+		}
+		if types.IsBackingImageTempHead(lvolName) {
+			if state.backingImageMap[types.GetBackingImageSnapLvolNameFromTempHeadLvolName(lvolName)] == nil {
+				lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
+				logrus.Infof("Found one backing image temp head lvol %v while there is no backing image record in the server", lvolName)
+				if err := cleanupOrphanBackingImageTempHead(state.spdkClient, lvsUUIDNameMap[lvsUUID], lvolName); err != nil {
+					logrus.WithError(err).Warnf("Failed to clean up orphan backing image temp head")
+				}
+			}
+			continue
+		}
+		if state.replicaMap[lvolName] != nil {
+			continue
+		}
+		// shardMap is keyed by external shard name (<volumeName>-<slotIndex>);
+		// translate from the on-disk lvolName before checking.
+		if volumeName, slotIndex, err := ParseShardLvolName(lvolName); err == nil {
+			if state.shardMap[GetShardName(volumeName, slotIndex)] != nil {
+				continue
+			}
+		}
+		if state.backingImageMap[lvolName] != nil {
+			continue
+		}
+		if IsRebuildingLvol(lvolName) {
+			if state.replicaMap[GetReplicaNameFromRebuildingLvolName(lvolName)] != nil {
+				continue
+			}
+		}
+		if IsCloningLvol(lvolName) {
+			if state.replicaMap[GetReplicaNameFromCloningLvolName(lvolName)] != nil {
+				continue
+			}
+		}
+		if types.IsBackingImageSnapLvolName(lvolName) {
+			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
+			backingImageName, _, err := ExtractBackingImageAndDiskUUID(lvolName)
+			if err != nil {
+				logrus.WithError(err).Warnf("failed to extract backing image name and disk UUID from lvol name %v", lvolName)
+				continue
+			}
+			size := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
+			alias := bdevLvol.Aliases[0]
+			expectedChecksum, err := GetSnapXattr(state.spdkClient, alias, types.LonghornBackingImageSnapshotAttrChecksum)
+			if err != nil {
+				logrus.WithError(err).Warnf("failed to retrieve checksum attribute for backing image snapshot %v", alias)
+				continue
+			}
+			backingImageUUID, err := GetSnapXattr(state.spdkClient, alias, types.LonghornBackingImageSnapshotAttrUUID)
+			if err != nil {
+				logrus.WithError(err).Warnf("failed to retrieve backing image UUID attribute for snapshot %v", alias)
+				continue
+			}
+			backingImage := NewBackingImage(s.ctx, backingImageName, backingImageUUID, lvsUUID, size, expectedChecksum,
+				s.updateChs[types.InstanceTypeBackingImage],
+				func(address string) (backingImageServiceClient, error) {
+					return s.newServiceClient(address)
+				})
+			backingImage.Alias = alias
+			backingImage.State = types.BackingImageStatePending
+			state.backingImageForSync[lvolName] = backingImage
+			state.backingImageMap[lvolName] = backingImage
+		} else if IsProbablyReplicaName(lvolName) {
+			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
+			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
+			actualSize := bdevLvol.DriverSpecific.Lvol.NumAllocatedClusters * uint64(defaultClusterSize)
+			state.replicaMap[lvolName] = NewReplica(s.ctx, lvolName, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, true, s.updateChs[types.InstanceTypeReplica], s.newServiceClient)
+			state.replicaMapForSync[lvolName] = state.replicaMap[lvolName]
+			logrus.Infof("Detected one possible existing replica %s(%s) with disk %s(%s), spec size %d, actual size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, actualSize)
+		} else if volumeName, slotIndex, err := ParseShardLvolName(lvolName); err == nil {
+			lvsUUID := bdevLvol.DriverSpecific.Lvol.LvolStoreUUID
+			specSize := bdevLvol.NumBlocks * uint64(bdevLvol.BlockSize)
+			shard := NewShard(volumeName, slotIndex, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize, s.updateChs[types.InstanceTypeShard])
+			shard.UUID = bdevLvol.UUID
+			// Key by the external shard name (matches what clients send via
+			// Name); the on-disk lvolName is preserved on shard.LvolName.
+			state.shardMap[shard.Name] = shard
+			state.shardMapForSync[shard.Name] = shard
+			logrus.Infof("Detected one possible existing shard %s(%s) with lvstore %s(%s), spec size %d", bdevLvol.Aliases[0], bdevLvol.UUID, lvsUUIDNameMap[lvsUUID], lvsUUID, specSize)
+		}
+	}
+
+	// Remove replicas from the cache if their lvol bdevs are gone.
+	for replicaName, r := range state.replicaMap {
+		// Try the best to avoid eliminating broken replicas or rebuilding replicas
+		if bdevLvolMap[r.Name] == nil {
+			if r.IsRebuilding() {
+				continue
+			}
+			noReplicaLvol := true
+			for lvolName := range bdevLvolMap {
+				if IsReplicaLvol(r.Name, lvolName) {
+					noReplicaLvol = false
+					break
+				}
+			}
+			if noReplicaLvol {
+				delete(state.replicaMap, replicaName)
+				delete(state.replicaMapForSync, replicaName)
+			}
+		}
+	}
+
+	// Remove shards from the cache if their lvol bdevs are gone.
+	for shardName, shard := range state.shardMap {
+		if bdevLvolMap[shard.LvolName] == nil {
+			delete(state.shardMap, shardName)
+			delete(state.shardMapForSync, shardName)
+		}
+	}
+
+	return nil
+}
+
+func (s *Server) syncVerifiedObjects(state *verifyState) error {
+	for _, r := range state.replicaMapForSync {
+		if err := r.Sync(state.spdkClient); err != nil && jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+			return err
+		}
+	}
+
+	for _, e := range state.engineMapForSync {
+		if err := e.ValidateAndUpdate(state.spdkClient); err != nil && jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+			return err
+		}
+	}
+
+	for _, ef := range state.engineFrontendForSync {
+		if err := ef.ValidateAndUpdate(state.spdkClient); err != nil && jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+			return err
+		}
+	}
+
+	for _, bi := range state.backingImageForSync {
+		if err := bi.ValidateAndUpdate(state.spdkClient); err != nil {
+			if jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+				return err
+			}
+			continue
+		}
+	}
+
+	for _, shard := range state.shardMapForSync {
+		if err := shard.Sync(state.spdkClient); err != nil && jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+			return err
+		}
+	}
+
+	for _, shardGroup := range state.shardGroupMapForSync {
+		if err := shardGroup.Sync(state.spdkClient); err != nil && jsonrpc.IsJSONRPCRespErrorBrokenPipe(err) {
+			return err
+		}
+	}
+
+	// TODO: send update signals if there is a Replica/Replica change
+	return nil
+}
+
+func (s *Server) broadcasting() {
+	for {
+		select {
+		case <-s.ctx.Done():
+			logrus.Info("spdk gRPC server: stopped broadcasting instances due to the context done")
+			// Keep draining updateChs so that senders on unbuffered channels
+			// do not block forever after broadcasting stops forwarding.
+			// Other goroutines will eventually observe ctx.Done() and stop sending.
+			for {
+				select {
+				case <-s.updateChs[types.InstanceTypeReplica]:
+				case <-s.updateChs[types.InstanceTypeEngine]:
+				case <-s.updateChs[types.InstanceTypeEngineFrontend]:
+				case <-s.updateChs[types.InstanceTypeBackingImage]:
+				case <-s.updateChs[types.InstanceTypeShard]:
+				case <-s.updateChs[types.InstanceTypeShardGroup]:
+				}
+			}
+		case <-s.updateChs[types.InstanceTypeReplica]:
+			s.broadcastChs[types.InstanceTypeReplica] <- nil
+		case <-s.updateChs[types.InstanceTypeEngine]:
+			s.broadcastChs[types.InstanceTypeEngine] <- nil
+		case <-s.updateChs[types.InstanceTypeEngineFrontend]:
+			s.broadcastChs[types.InstanceTypeEngineFrontend] <- nil
+		case <-s.updateChs[types.InstanceTypeBackingImage]:
+			s.broadcastChs[types.InstanceTypeBackingImage] <- nil
+		case <-s.updateChs[types.InstanceTypeShard]:
+			s.broadcastChs[types.InstanceTypeShard] <- nil
+		case <-s.updateChs[types.InstanceTypeShardGroup]:
+			s.broadcastChs[types.InstanceTypeShardGroup] <- nil
+		}
+	}
+}
+
+func (s *Server) Subscribe(ctx context.Context, instanceType types.InstanceType) (<-chan interface{}, error) {
+	switch instanceType {
+	case types.InstanceTypeEngine:
+		return s.broadcasters[types.InstanceTypeEngine].Subscribe(ctx, s.engineBroadcastConnector)
+	case types.InstanceTypeEngineFrontend:
+		return s.broadcasters[types.InstanceTypeEngineFrontend].Subscribe(ctx, s.engineFrontendBroadcastConnector)
+	case types.InstanceTypeReplica:
+		return s.broadcasters[types.InstanceTypeReplica].Subscribe(ctx, s.replicaBroadcastConnector)
+	case types.InstanceTypeBackingImage:
+		return s.broadcasters[types.InstanceTypeBackingImage].Subscribe(ctx, s.backingImageBroadcastConnector)
+	case types.InstanceTypeShard:
+		return s.broadcasters[types.InstanceTypeShard].Subscribe(ctx, s.shardBroadcastConnector)
+	case types.InstanceTypeShardGroup:
+		return s.broadcasters[types.InstanceTypeShardGroup].Subscribe(ctx, s.shardGroupBroadcastConnector)
+	}
+	return nil, fmt.Errorf("invalid instance type %v for subscription", instanceType)
+}
+
+func (s *Server) replicaBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeReplica], nil
+}
+
+func (s *Server) engineBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeEngine], nil
+}
+
+func (s *Server) engineFrontendBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeEngineFrontend], nil
+}
+
+func (s *Server) backingImageBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeBackingImage], nil
+}
+
+func (s *Server) shardBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeShard], nil
+}
+
+func (s *Server) shardGroupBroadcastConnector() (chan interface{}, error) {
+	return s.broadcastChs[types.InstanceTypeShardGroup], nil
+}
+
+func (s *Server) isLvsExist(lvsUUID, lvsName string) (bool, error) {
+	if lvsUUID == "" && lvsName == "" {
+		return false, fmt.Errorf("either lvstore UUID or name must be provided")
+	}
+
+	name := ""
+	uuid := ""
+
+	if lvsUUID != "" {
+		uuid = lvsUUID
+	} else {
+		name = lvsName
+	}
+
+	lvsList, err := s.spdkClient.BdevLvolGetLvstore(name, uuid)
+	if err != nil {
+		return false, err
+	}
+
+	if len(lvsList) == 0 {
+		return false, fmt.Errorf("found zero lvstore with name %q and UUID %q", lvsName, lvsUUID)
+	}
+
+	return true, nil
+}
+
+func (s *Server) newReplica(req *spdkrpc.ReplicaCreateRequest) (*Replica, error) {
+	s.Lock()
+	defer func() {
+		s.Unlock()
+	}()
+
+	r, ok := s.replicaMap[req.Name]
+	if ok {
+		r.Lock()
+		if req.SpecSize != 0 {
+			r.SpecSize = req.SpecSize
+		}
+		if req.LvsName != "" {
+			r.LvsName = req.LvsName
+		}
+		if req.LvsUuid != "" {
+			r.LvsUUID = req.LvsUuid
+		}
+		r.Unlock()
+		return r, nil
+	}
+
+	exists, err := s.isLvsExist(req.LvsUuid, req.LvsName)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to check lvstore %v(%v) existence for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
+	}
+	if !exists {
+		return nil, fmt.Errorf("lvstore %v(%v) does not exist for replica %v creation", req.LvsName, req.LvsUuid, req.Name)
+	}
+	return NewReplica(s.ctx, req.Name, req.LvsName, req.LvsUuid, req.SpecSize, true, s.updateChs[types.InstanceTypeReplica], s.newServiceClient), nil
+}
+
+func (s *Server) getBackingImage(backingImageName, lvsUUID string) (backingImage *BackingImage, err error) {
+	backingImageSnapLvolName := GetBackingImageSnapLvolName(backingImageName, lvsUUID)
+
+	s.RLock()
+	backingImage = s.backingImageMap[backingImageSnapLvolName]
+	s.RUnlock()
+
+	if backingImage == nil {
+		return nil, grpcstatus.Error(grpccodes.NotFound, "failed to find the backing image in the spdk server")
+	}
+
+	return backingImage, nil
+}
+
+func toSwitchOverGRPCError(err error, format string, args ...interface{}) error {
+	code := grpccodes.Internal
+
+	// Preserve downstream gRPC code when available.
+	if statusErr, ok := grpcstatus.FromError(errors.UnwrapAll(err)); ok {
+		code = statusErr.Code()
+	} else {
+		switch {
+		case errors.Is(err, ErrSwitchOverTargetInvalidInput):
+			code = grpccodes.InvalidArgument
+		case errors.Is(err, ErrSwitchOverTargetPrecondition):
+			code = grpccodes.FailedPrecondition
+		case errors.Is(err, ErrSwitchOverTargetEngineNotFound):
+			code = grpccodes.NotFound
+		case errors.Is(err, context.DeadlineExceeded):
+			code = grpccodes.DeadlineExceeded
+		case errors.Is(err, context.Canceled):
+			code = grpccodes.Canceled
+		}
+	}
+
+	return grpcstatus.Error(code, errors.Wrapf(err, format, args...).Error())
+}
+
+// buildGRPCReplicaAddFrontendSuspendResumeWrapper builds a replicaAddFrontendSuspendResumeWrapper that
+// calls back to the EngineFrontend on a (potentially remote) node via gRPC
+// for suspend/resume around the work step.
+//
+// If suspendRequired is set (the rebuild snapshot), work does not run unless the
+// frontend is suspended: I/O may still flow from a frontend that cannot be
+// reached or suspended right now (e.g. while it switches over its target), and
+// failing the replica add is cheap, as nothing has been done yet. The only
+// exception is a frontend type that cannot be suspended at all.
+//
+// Otherwise (the finish step), the wrapper proceeds without suspension: the data
+// has already been copied, and not running the work would leak SPDK resources
+// (detach controller, stop expose).
+func buildGRPCReplicaAddFrontendSuspendResumeWrapper(efName, efAddress string, log *logrus.Entry, newServiceClient ServiceClientFactory) replicaAddFrontendSuspendResumeWrapper {
+	if newServiceClient == nil {
+		newServiceClient = GetServiceClient
+	}
+	return func(work func() error, suspendRequired bool) error {
+		efClient, err := newServiceClient(efAddress)
+		if err != nil {
+			if suspendRequired {
+				return errors.Wrapf(err, "engine frontend %s at %s is unreachable, cannot suspend it before replica add work", efName, efAddress)
+			}
+			log.WithError(err).Warnf("Engine frontend %s at %s is unreachable, proceeding without suspension", efName, efAddress)
+			return work()
+		}
+		defer func() {
+			if errClose := efClient.Close(); errClose != nil {
+				log.WithError(errClose).Warnf("Failed to close engine frontend SPDK client for %s", efName)
+			}
+		}()
+
+		suspended := false
+		if err := efClient.EngineFrontendSuspend(efName); err != nil {
+			if suspendRequired && grpcstatus.Code(errors.UnwrapAll(err)) != grpccodes.Unimplemented {
+				return errors.Wrapf(err, "failed to suspend engine frontend %s before replica add work", efName)
+			}
+			log.WithError(err).Warnf("Failed to suspend engine frontend %s before replica add work, proceeding without suspension", efName)
+		} else {
+			suspended = true
+		}
+
+		workErr := work()
+
+		// Resume the frontend after the work.
+		// If resume fails (EF disappeared during work, or internal error),
+		// log a warning but do not override workErr — the replica-add result
+		// is determined by work(), not by resume. longhorn-manager will
+		// detect the stuck-suspended EF and handle recovery.
+		if suspended {
+			if resumeErr := efClient.EngineFrontendResume(efName); resumeErr != nil {
+				log.WithError(resumeErr).Errorf("Failed to resume engine frontend %s after replica add work (work succeeded: %v)", efName, workErr == nil)
+			}
+		}
+
+		return workErr
+	}
+}
+
+func (s *Server) VersionDetailGet(context.Context, *emptypb.Empty) (*spdkrpc.VersionDetailGetReply, error) {
+	// TODO: Implement this
+	return &spdkrpc.VersionDetailGetReply{
+		Version: &spdkrpc.VersionOutput{},
+	}, nil
+}
+
+func (s *Server) newBackingImage(req *spdkrpc.BackingImageCreateRequest) (*BackingImage, error) {
+	s.Lock()
+	defer s.Unlock()
+
+	// The backing image key is in this form "bi-%s-disk-%s" to distinguish different disks.
+	backingImageSnapLvolName := GetBackingImageSnapLvolName(req.Name, req.LvsUuid)
+	if _, ok := s.backingImageMap[backingImageSnapLvolName]; !ok {
+		exists, err := s.isLvsExist(req.LvsUuid, "")
+		if err != nil || !exists {
+			return nil, err
+		}
+		s.backingImageMap[backingImageSnapLvolName] = NewBackingImage(s.ctx, req.Name, req.BackingImageUuid, req.LvsUuid, req.Size, req.Checksum,
+			s.updateChs[types.InstanceTypeBackingImage],
+			func(address string) (backingImageServiceClient, error) {
+				return s.newServiceClient(address)
+			})
+	}
+
+	return s.backingImageMap[backingImageSnapLvolName], nil
+}
+
+func (s *Server) UpdateEngineMetrics() {
+	if s.spdkClient == nil {
+		return
+	}
+
+	previousBdevIostat := s.currentBdevIostat
+	bdevIostat, err := s.spdkClient.BdevGetIostat("", false)
+	if err != nil {
+		logrus.WithError(err).Error("failed to get bdev iostat")
+		return
+	}
+	s.currentBdevIostat = bdevIostat
+	// If this is the first execution, there is no previous data, so exit
+	if previousBdevIostat == nil {
+		return
+	}
+	// Calculate the elapsed time in ticks
+	tickElapsed := s.currentBdevIostat.Ticks - previousBdevIostat.Ticks
+	if tickElapsed == 0 {
+		return
+	}
+	// Convert ticks to seconds
+	elapsedSeconds := float64(tickElapsed) / float64(s.currentBdevIostat.TickRate)
+
+	// Convert previous Bdev data into a map for quick lookup
+	prevBdevMap := make(map[string]spdktypes.BdevStats)
+	for _, prevBdev := range previousBdevIostat.Bdevs {
+		prevBdevMap[prevBdev.Name] = prevBdev
+	}
+
+	// Initialize a new BdevMetricMap
+	s.bdevMetricMap = make(map[string]*spdkrpc.Metrics)
+	for _, bdev := range s.currentBdevIostat.Bdevs {
+		prevBdev, exists := prevBdevMap[bdev.Name]
+		if !exists {
+			continue
+		}
+
+		// Calculate differences in operations and data
+		readOpsDiff := bdev.NumReadOps - prevBdev.NumReadOps
+		writeOpsDiff := bdev.NumWriteOps - prevBdev.NumWriteOps
+		bytesReadDiff := bdev.BytesRead - prevBdev.BytesRead
+		bytesWrittenDiff := bdev.BytesWritten - prevBdev.BytesWritten
+		readLatencyDiff := bdev.ReadLatencyTicks - prevBdev.ReadLatencyTicks
+		writeLatencyDiff := bdev.WriteLatencyTicks - prevBdev.WriteLatencyTicks
+
+		// Convert latency from ticks to nanoseconds
+		readLatency := calculateLatencyInNs(readLatencyDiff, readOpsDiff, s.currentBdevIostat.TickRate)
+		writeLatency := calculateLatencyInNs(writeLatencyDiff, writeOpsDiff, s.currentBdevIostat.TickRate)
+
+		s.bdevMetricMap[bdev.Name] = &spdkrpc.Metrics{
+			ReadIOPS:        uint64(float64(readOpsDiff) / elapsedSeconds),
+			WriteIOPS:       uint64(float64(writeOpsDiff) / elapsedSeconds),
+			ReadThroughput:  uint64(float64(bytesReadDiff) / elapsedSeconds),
+			WriteThroughput: uint64(float64(bytesWrittenDiff) / elapsedSeconds),
+			ReadLatency:     readLatency,
+			WriteLatency:    writeLatency,
+		}
+	}
+}
+
+// Converts latency from ticks to nanoseconds
+func calculateLatencyInNs(latencyTicks, opsDiff, tickRate uint64) uint64 {
+	if opsDiff == 0 {
+		return 0 // Prevent division by zero
+	}
+	return uint64((float64(latencyTicks) / float64(opsDiff)) * (1e9 / float64(tickRate)))
+}
+
+func (s *Server) MetricsGet(ctx context.Context, req *spdkrpc.MetricsRequest) (ret *spdkrpc.Metrics, err error) {
+	s.RLock()
+	defer s.RUnlock()
+	m, ok := s.bdevMetricMap[req.Name]
+	if !ok {
+		return nil, grpcstatus.Errorf(grpccodes.NotFound, "cannot find engine metrics: %s", req.Name)
+	}
+	return m, nil
+}
+
+func setNvmeHotPlug(spdkClient *spdkclient.Client, enable bool) (success bool) {
+	// default value: 100000 microseconds = 0.1 seconds
+	_, hotPlugErr := spdkClient.BdevNvmeSetHotplug(enable, 100000)
+	if hotPlugErr != nil {
+		logrus.WithError(hotPlugErr).Warnf("Failed to set nvme hotplug to %v", enable)
+		return false
+	}
+	return true
+}
+
+// volumeHostLockEntry is a reference-counted per-volume mutex.
+type volumeHostLockEntry struct {
+	mu       sync.Mutex
+	refCount int32
+}
+
+// acquireVolumeHostLock atomically looks up (or creates) the per-volume lock,
+// increments its reference count, and acquires the mutex. The returned
+// function releases the mutex and decrements the reference count; when the
+// count reaches zero the entry is removed from the map, bounding memory to
+// the number of concurrently active volumes.
+func (s *Server) acquireVolumeHostLock(volumeName string) func() {
+	s.volumeHostLocksMu.Lock()
+	if s.volumeHostLocks == nil {
+		s.volumeHostLocks = map[string]*volumeHostLockEntry{}
+	}
+	entry, ok := s.volumeHostLocks[volumeName]
+	if !ok {
+		entry = &volumeHostLockEntry{}
+		s.volumeHostLocks[volumeName] = entry
+	}
+	atomic.AddInt32(&entry.refCount, 1)
+	s.volumeHostLocksMu.Unlock()
+
+	entry.mu.Lock()
+
+	return func() {
+		entry.mu.Unlock()
+		if atomic.AddInt32(&entry.refCount, -1) == 0 {
+			s.volumeHostLocksMu.Lock()
+			// Re-check under map lock: another goroutine may have
+			// incremented refCount between our Add and this Lock.
+			if atomic.LoadInt32(&entry.refCount) == 0 {
+				delete(s.volumeHostLocks, volumeName)
+			}
+			s.volumeHostLocksMu.Unlock()
+		}
+	}
+}
+
+// engineFrontendByVolumeName returns the first engine frontend that matches
+// the given volume name, or nil if none exists. Caller must hold s.RLock or
+// s.Lock.
+func (s *Server) engineFrontendByVolumeName(volumeName string) *EngineFrontend {
+	for _, ef := range s.engineFrontendMap {
+		if ef.VolumeName == volumeName {
+			return ef
+		}
+	}
+	return nil
+}
+
+func toEngineFrontendCreateGRPCError(err error, format string, args ...any) error {
+	code := grpccodes.Internal
+
+	// Check sentinel errors first — they are the most specific indicators
+	// of what went wrong and should take priority over any embedded gRPC
+	// status that might exist deeper in the error chain.
+	switch {
+	case errors.Is(err, ErrEngineFrontendCreateInvalidArgument):
+		code = grpccodes.InvalidArgument
+	case errors.Is(err, ErrEngineFrontendCreatePrecondition):
+		code = grpccodes.FailedPrecondition
+	case errors.Is(err, context.DeadlineExceeded):
+		code = grpccodes.DeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		code = grpccodes.Canceled
+	default:
+		// Fall back to any embedded gRPC status.
+		if statusErr, ok := grpcstatus.FromError(errors.UnwrapAll(err)); ok {
+			code = statusErr.Code()
+		}
+	}
+
+	return grpcstatus.Error(code, errors.Wrapf(err, format, args...).Error())
+}
+
+func toEngineFrontendLifecycleGRPCError(err error, format string, args ...any) error {
+	code := grpccodes.Internal
+
+	switch {
+	case errors.Is(err, ErrEngineFrontendLifecyclePrecondition), errors.Is(err, ErrSwitchOverTargetPrecondition):
+		code = grpccodes.FailedPrecondition
+	case errors.Is(err, ErrEngineFrontendLifecycleUnimplemented):
+		code = grpccodes.Unimplemented
+	case errors.Is(err, context.DeadlineExceeded):
+		code = grpccodes.DeadlineExceeded
+	case errors.Is(err, context.Canceled):
+		code = grpccodes.Canceled
+	default:
+		if statusErr, ok := grpcstatus.FromError(errors.UnwrapAll(err)); ok {
+			code = statusErr.Code()
+		}
+	}
+
+	return grpcstatus.Error(code, errors.Wrapf(err, format, args...).Error())
+}
+
+func toExpansionGRPCError(err error, format string, args ...interface{}) error {
+	code := grpccodes.Internal
+
+	// Preserve downstream gRPC code when available.
+	if statusErr, ok := grpcstatus.FromError(errors.UnwrapAll(err)); ok {
+		code = statusErr.Code()
+	} else {
+		switch {
+		case errors.Is(err, ErrExpansionInProgress), errors.Is(err, ErrRestoringInProgress):
+			code = grpccodes.FailedPrecondition
+		case errors.Is(err, ErrExpansionInvalidSize):
+			code = grpccodes.InvalidArgument
+		case errors.Is(err, context.DeadlineExceeded):
+			code = grpccodes.DeadlineExceeded
+		case errors.Is(err, context.Canceled):
+			code = grpccodes.Canceled
+		}
+	}
+
+	return grpcstatus.Error(code, errors.Wrapf(err, format, args...).Error())
+}
+
+// GetEngineStruct returns the internal Engine struct.
+// This is for testing purposes only to allow access to internal fields and methods not exposed via RPC.
+func (s *Server) GetEngineStruct(name string) *Engine {
+	s.RLock()
+	defer s.RUnlock()
+	return s.engineMap[name]
+}
+
+// GetReplicaStruct returns the internal Replica struct.
+// This is for testing purposes only to allow tests to inspect or manipulate internal replica state.
+func (s *Server) GetReplicaStruct(name string) *Replica {
+	s.RLock()
+	defer s.RUnlock()
+	return s.replicaMap[name]
+}
+
+// recoverEngineFrontends loads persisted engine frontend records from disk
+// and attempts to recover them by detecting existing NVMe initiators on the host.
+// This is called during server startup to restore state after instance-manager restart.
+func (s *Server) recoverEngineFrontends(ctx context.Context) {
+	if s.metadataDir == "" {
+		return
+	}
+
+	records, err := loadEngineFrontendRecords(s.metadataDir)
+	if err != nil {
+		logrus.WithError(err).Error("Failed to load engine frontend records for recovery")
+		return
+	}
+
+	if len(records) == 0 {
+		return
+	}
+
+	logrus.Infof("Recovering %d engine frontend(s) from persisted records", len(records))
+
+	// recoveryEfs keeps our own references to efs inserted during the
+	// insertion loop. The recovery loop uses these instead of reading
+	// from engineFrontendMap, which avoids accidentally operating on a
+	// NEW ef registered by a concurrent EngineFrontendCreate.
+	recoveryEfs := make(map[string]*EngineFrontend, len(records))
+
+	s.Lock()
+	for _, record := range records {
+		if _, exists := s.engineFrontendMap[record.Name]; exists {
+			logrus.Infof("Engine frontend %s already exists in map, skipping recovery", record.Name)
+			continue
+		}
+
+		// Check volume uniqueness — a concurrent frontend lifecycle RPC may
+		// already have registered an in-memory frontend for this volume while
+		// we were loading records from disk. Skip recovery so we do not race
+		// that in-memory owner on the host. The on-disk record may already
+		// belong to the in-memory frontend or may still be stale from the old
+		// one; reconciliation stays with the live frontend instance.
+		if existing := s.engineFrontendByVolumeName(record.VolumeName); existing != nil {
+			logrus.Warnf("Engine frontend %s already exists for volume %s, skipping recovery of %s",
+				existing.Name, record.VolumeName, record.Name)
+			continue
+		}
+
+		ef := NewEngineFrontend(record.Name, record.EngineName, record.VolumeName,
+			record.Frontend, record.SpecSize, 0, 0, s.updateChs[types.InstanceTypeEngineFrontend], s.newServiceClient)
+		ef.NvmeTcpFrontend.NrIoQueues = record.NrIoQueues
+		ef.metadataDir = s.metadataDir
+		ef.VolumeNQN = record.VolumeNQN
+		ef.VolumeNGUID = record.VolumeNGUID
+		ef.ActivePath = record.ActivePath
+		ef.PreferredPath = record.PreferredPath
+		if len(record.Paths) > 0 {
+			ef.NvmeTCPPathMap = map[string]*NvmeTCPPath{}
+			for _, path := range record.Paths {
+				if path == nil {
+					continue
+				}
+				address := getNvmeTCPPathAddress(path.TargetIP, path.TargetPort)
+				if address == "" {
+					continue
+				}
+				ef.NvmeTCPPathMap[address] = &NvmeTCPPath{
+					TargetIP:   path.TargetIP,
+					TargetPort: path.TargetPort,
+					EngineName: path.EngineName,
+					Nqn:        path.Nqn,
+					Nguid:      path.Nguid,
+					ANAState:   path.ANAState,
+				}
+			}
+		}
+		if ef.NvmeTcpFrontend != nil {
+			if record.TargetIP != "" {
+				ef.NvmeTcpFrontend.TargetIP = record.TargetIP
+			}
+			if record.TargetPort != 0 {
+				ef.NvmeTcpFrontend.TargetPort = record.TargetPort
+			}
+		}
+		if record.TargetIP != "" {
+			ef.EngineIP = record.TargetIP
+		}
+
+		s.engineFrontendMap[record.Name] = ef
+		recoveryEfs[record.Name] = ef
+
+		logrus.Infof("Recovered engine frontend %s for volume %s from persisted record", record.Name, record.VolumeName)
+	}
+	s.Unlock()
+
+	// Attempt to recover each frontend's initiator state from the host.
+	// This is done outside the server lock to avoid holding it during potentially
+	// slow NVMe device discovery operations.
+	// Use recoveryEfs (our own references) rather than reading from engineFrontendMap
+	// to avoid accidentally calling RecoverFromHost/Delete on a NEW ef that a
+	// concurrent EngineFrontendCreate registered under the same name.
+	for _, record := range records {
+		select {
+		case <-ctx.Done():
+			logrus.Info("Engine frontend recovery cancelled by context")
+			return
+		default:
+		}
+
+		ef := recoveryEfs[record.Name]
+		if ef == nil {
+			continue
+		}
+
+		// Hold the per-volume host lock for the entire recovery lifecycle
+		// (RecoverFromHost + cleanup/Delete) so that a concurrent
+		// EngineFrontendCreate for the same volume cannot start its own
+		// host NVMe/dm operations until both recovery AND cleanup finish.
+		// Releasing the lock before Delete would allow Create to race with
+		// the old ef's initiator.Stop(), which could disconnect an NVMe
+		// controller that the new ef's Create() just connected (they share
+		// the same subsystem NQN derived from the volume name).
+		unlockVolumeHost := s.acquireVolumeHostLock(ef.VolumeName)
+
+		// Read spdkClient fresh each iteration — clientReconnect() can
+		// replace s.spdkClient and close the old one concurrently.
+		s.RLock()
+		spdkClient := s.spdkClient
+		s.RUnlock()
+
+		recoverErr := ef.RecoverFromHost(spdkClient)
+
+		if recoverErr != nil {
+			if errors.Is(recoverErr, ErrRecoverDeviceNotFound) {
+				logrus.Warnf("Removing engine frontend %s from map: device not found on host", record.Name)
+			} else if errors.Is(recoverErr, ErrRecoveryCancelled) {
+				logrus.Infof("Recovery of engine frontend %s cancelled: evicted by concurrent operation", record.Name)
+			} else {
+				logrus.WithError(recoverErr).Warnf("Removing engine frontend %s from map: recovery failed", record.Name)
+			}
+
+			// Properly shut down the frontend instance (close stopCh,
+			// clean up any partially-recovered initiator, remove the
+			// persisted record) before removing it from the map.
+			// This follows the same pattern as the race-loser cleanup
+			// in EngineFrontendCreate.
+			if deleteErr := ef.Delete(spdkClient); deleteErr != nil {
+				logrus.WithError(deleteErr).Warnf("Failed to clean up engine frontend %s during recovery removal", record.Name)
+			}
+
+			// Only remove from map if this entry still belongs to us.
+			// A concurrent EngineFrontendCreate may have already evicted
+			// us and registered a new frontend under the same name.
+			s.Lock()
+			if s.engineFrontendMap[record.Name] == ef {
+				delete(s.engineFrontendMap, record.Name)
+			}
+			s.Unlock()
+		} else {
+			// Recovery succeeded — verify the ef was not superseded by a
+			// concurrent EngineFrontendCreate while RecoverFromHost was running.
+			s.RLock()
+			current := s.engineFrontendMap[record.Name]
+			s.RUnlock()
+
+			if current != ef {
+				logrus.Warnf("Engine frontend %s was superseded during recovery, cleaning up recovered resources", record.Name)
+				// The eviction path in EngineFrontendCreate already decided
+				// whether metadataDir should be kept (pre-create eviction,
+				// where no new record exists yet) or cleared (post-create
+				// eviction with successful Create, where a new record was
+				// written). Respect that decision — do not override here.
+				if deleteErr := ef.Delete(spdkClient); deleteErr != nil {
+					logrus.WithError(deleteErr).Warnf("Failed to clean up superseded engine frontend %s", record.Name)
+				}
+			}
+		}
+
+		unlockVolumeHost()
+	}
+}

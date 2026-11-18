@@ -1,0 +1,35 @@
+#!/bin/bash
+
+PROC_DIR="/host/proc"
+
+os_distro_talos="talos"
+os_distro=""
+
+get_os_distro() {
+  local version_info=$(< $PROC_DIR/version)
+
+  [[ $version_info =~ $os_distro_talos ]] && os_distro=$os_distro_talos
+}
+
+target_pid=1
+
+get_pid() {
+  local match
+  match=$(printf '%s\0' "$PROC_DIR"/[0-9]*/comm | xargs -0 grep -lxF -e "$1" 2>/dev/null | tail -n 1)
+  if [ -n "$match" ]; then
+    match=${match#"$PROC_DIR"/}
+    target_pid=${match%/comm}
+  fi
+}
+
+get_os_distro
+
+[[ $os_distro = $os_distro_talos ]] && get_pid "kubelet"
+
+# Use namespace files instead of -t to avoid the need for HostPID.
+ns_dir="$PROC_DIR/$target_pid/ns"
+ns_mnt="$ns_dir/mnt"
+ns_net="$ns_dir/net"
+ns_uts="$ns_dir/uts"
+
+nsenter --mount="$ns_mnt" --net="$ns_net" --uts="$ns_uts" -- "$@"

@@ -1,0 +1,114 @@
+package types
+
+import (
+	"fmt"
+	"strings"
+	"time"
+)
+
+const (
+	NQNPrefix = "nqn.2023-01.io.longhorn.spdk"
+
+	// InternalHostNQN is the host NQN the SPDK bdev_nvme initiator presents when it attaches a
+	// subsystem that only SPDK consumes, never a host kernel initiator (e.g. a replica lvol
+	// attached by an engine). Subsystems restricted to it are hidden from other hosts.
+	InternalHostNQN = NQNPrefix + ":internal-host"
+
+	DefaultJSONServerNetwork    = "unix"
+	DefaultUnixDomainSocketPath = "/var/tmp/spdk.sock"
+
+	LocalIP = "127.0.0.1"
+
+	MiB = 1 << 20
+
+	FrontendSPDKTCPNvmf     = "spdk-tcp-nvmf"
+	FrontendSPDKTCPBlockdev = "spdk-tcp-blockdev"
+	FrontendSPDKUblk        = "ublk"
+
+	ShallowCopyStateInProgress = "in progress"
+	ShallowCopyStateComplete   = "complete"
+	ShallowCopyStateError      = "error"
+
+	ExecuteTimeout = 180 * time.Second
+
+	// DmsetupTimeout covers every dmsetup call and NvmeDisconnectTimeout the NVMe
+	// disconnects. Those run while the initiator holds its per-volume file lock and
+	// are the ones that can block on a device the kernel is stuck on, so both stay
+	// below that lock timeout: otherwise one wedged device starves every other
+	// operation on the same volume until its lock waiters give up.
+	DmsetupTimeout        = 30 * time.Second
+	NvmeDisconnectTimeout = 30 * time.Second
+)
+
+const (
+	ErrorMessageCannotFindValidNvmeDevice = "cannot find a valid NVMe device"
+	ErrorMessageDeviceOrResourceBusy      = "device or resource busy"
+	ErrorMessageDuplicateCntlid           = "duplicate cntlid"
+	ErrorMessageNoSuchFileOrDirectory     = "no such file or directory"
+	ErrorMessageFailedToGetInitiatorLock  = "failed to get file lock for initiator"
+	// ErrorMessageTimeoutExecuting is what go-common-libs reports when a command
+	// outlives its timeout; the executor sends SIGKILL to the command's process group,
+	// but a process blocked in the kernel may not terminate promptly.
+	ErrorMessageTimeoutExecuting = "timeout executing:"
+)
+
+const (
+	// Sequence of Events:
+	// 1. Issuing I/O Command: The system sends a read command to the NVMe SSD.
+	// 2. Waiting for ACK: The system waits for an acknowledgment from the NVMe SSD.
+	// 3. Timeout: If no ACK is received within 2^transport_ack_timeout milliseconds,
+	//    the system considers the I/O operation as a failure and attempts to resend it.
+	// 4. Fast I/O Failure: If multiple retries fail consecutively and the total elapsed
+	//    time exceeds fast_io_fail_timeout_sec seconds, the system determines that the I/O
+	//    operation is stuck and takes further actions, such as raising an alarm or switching
+	//    to a backup path.
+	// 5. Controller Loss: If the NVMe SSD does not respond at all for more than
+	//    ctrlr_loss_timeout_sec seconds, the system considers the controller as lost.
+	// 6. Reconnect Attempt: The system attempts to reconnect to the NVMe SSD every
+	//    2Reconnect_Delay_Sec seconds.
+
+	DefaultCtrlrLossTimeoutSec = 15
+	// DefaultReconnectDelaySec can't be more than DefaultFastIOFailTimeoutSec.
+	DefaultReconnectDelaySec    = 2
+	DefaultFastIOFailTimeoutSec = 10
+
+	// DefaultTransportAckTimeout value is not the timeout second.
+	// The timeout formula is 2^(transport_ack_timeout) msec.
+	// DefaultTransportAckTimeout is set to 10, so the default timeout is 2^10 = 1024 msec = 1.024 sec.
+	// By default, error detection on a qpair is very slow for TCP transports. For fast error
+	// detection, transport_ack_timeout should be set.
+	DefaultTransportAckTimeout = 10
+
+	DefaultKeepAliveTimeoutMs = 10000
+	DefaultMultipath          = "disable"
+)
+
+func GetNQN(name string) string {
+	return fmt.Sprintf("%s:%s", NQNPrefix, name)
+}
+
+type DiskStatus struct {
+	Bdf          string
+	Type         string
+	Driver       string
+	Vendor       string
+	Numa         string
+	Device       string
+	BlockDevices string
+}
+
+func ErrorIsDeviceOrResourceBusy(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), ErrorMessageDeviceOrResourceBusy)
+}
+
+func ErrorIsValidNvmeDeviceNotFound(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), ErrorMessageCannotFindValidNvmeDevice)
+}
+
+func ErrorIsTimeoutExecuting(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), ErrorMessageTimeoutExecuting)
+}
+
+func ErrorIsDuplicateCntlid(err error) bool {
+	return err != nil && strings.Contains(strings.ToLower(err.Error()), ErrorMessageDuplicateCntlid)
+}

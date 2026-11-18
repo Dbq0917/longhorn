@@ -1,0 +1,675 @@
+package csi
+
+import (
+	"fmt"
+
+	"github.com/sirupsen/logrus"
+
+	"k8s.io/apimachinery/pkg/util/intstr"
+	"k8s.io/utils/ptr"
+
+	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
+	storagev1 "k8s.io/api/storage/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
+
+	"github.com/longhorn/longhorn-manager/datastore"
+	"github.com/longhorn/longhorn-manager/types"
+
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+)
+
+const (
+	DefaultCSIAttacherReplicaCount    = 3
+	DefaultCSIProvisionerReplicaCount = 3
+	DefaultCSIResizerReplicaCount     = 3
+	DefaultCSISnapshotterReplicaCount = 3
+
+	DefaultCSIPodAntiAffinityPreset      = CSIPodAntiAffinityPresetSoft
+	DefaultCSISocketFileName             = "csi.sock"
+	DefaultCSIRegistrationDirSuffix      = "/plugins_registry"
+	DefaultCSIPluginsDirSuffix           = "/plugins/"
+	DefaultKubernetesCSIDirSuffix        = "/kubernetes.io/csi/"
+	DefaultInContainerCSISocketDir       = "/csi/"
+	DefaultInContainerCSIRegistrationDir = "/registration"
+	DefaultCSILivenessProbePort          = 9808
+
+	AnnotationCSIGitCommit             = types.LonghornDriverName + "/git-commit"
+	AnnotationCSIVersion               = types.LonghornDriverName + "/version"
+	AnnotationCSIPodAntiAffinityPreset = types.LonghornDriverName + "/pod-anti-affinity-preset"
+
+	CSIPodAntiAffinityPresetSoft = "soft"
+	CSIPodAntiAffinityPresetHard = "hard"
+)
+
+var (
+	HostPathDirectoryOrCreate     = corev1.HostPathDirectoryOrCreate
+	MountPropagationBidirectional = corev1.MountPropagationBidirectional
+)
+
+type AttacherDeployment struct {
+	deployment *appsv1.Deployment
+}
+
+func NewAttacherDeployment(namespace, serviceAccount, attacherImage, rootDir string, replicaCount int, podAntiAffinityPreset string, tolerations []corev1.Toleration,
+	tolerationsString, priorityClass, registrySecret string, imagePullPolicy corev1.PullPolicy, nodeSelector map[string]string, resources *corev1.ResourceRequirements) *AttacherDeployment {
+
+	deployment := getCommonDeployment(
+		types.CSIAttacherName,
+		namespace,
+		serviceAccount,
+		attacherImage,
+		rootDir,
+		[]string{
+			"--v=2",
+			"--csi-address=$(ADDRESS)",
+			"--timeout=1m50s",
+			// Some special volume provisioning methods, like full-copy clone or
+			// restore, take time to pull data from an external source. Before the
+			// data copy finishes, the volume is not ready for workloads.
+			// ControllerPublishVolume will be rejected and retried multiple times
+			// with error "not ready for workloads" during this period.
+			// Using a small max retry interval helps reduce the volume idle time
+			// after it becomes ready.
+			"--retry-interval-max=1m",
+			"--leader-election",
+			"--leader-election-namespace=$(POD_NAMESPACE)",
+			fmt.Sprintf("--kube-api-qps=%v", types.KubeAPIQPS),
+			fmt.Sprintf("--kube-api-burst=%v", types.KubeAPIBurst),
+			fmt.Sprintf("--http-endpoint=:%v", types.CSISidecarMetricsPort),
+		},
+		int32(replicaCount),
+		podAntiAffinityPreset,
+		tolerations,
+		tolerationsString,
+		priorityClass,
+		registrySecret,
+		imagePullPolicy,
+		nodeSelector,
+		[]corev1.ContainerPort{
+			{
+				Name:          types.CSISidecarPortNameAttacher,
+				ContainerPort: types.CSISidecarMetricsPort,
+			},
+		},
+		resources,
+	)
+
+	return &AttacherDeployment{
+		deployment: deployment,
+	}
+}
+
+func (a *AttacherDeployment) Deploy(kubeClient *clientset.Clientset) error {
+	return deploy(kubeClient, a.deployment, "deployment",
+		deploymentCreateFunc, deploymentDeleteFunc, deploymentGetFunc, deploymentUpdateFunc)
+}
+
+func (a *AttacherDeployment) Cleanup(kubeClient *clientset.Clientset) {
+	if err := cleanup(kubeClient, a.deployment, "deployment",
+		deploymentDeleteFunc, deploymentGetFunc); err != nil {
+		logrus.Warnf("Failed to cleanup deployment in attacher deployment: %v", err)
+	}
+}
+
+type ProvisionerDeployment struct {
+	deployment *appsv1.Deployment
+}
+
+func NewProvisionerDeployment(namespace, serviceAccount, provisionerImage, rootDir string, replicaCount int, podAntiAffinityPreset string, tolerations []corev1.Toleration,
+	tolerationsString, priorityClass, registrySecret string, imagePullPolicy corev1.PullPolicy, nodeSelector map[string]string, resources *corev1.ResourceRequirements) *ProvisionerDeployment {
+
+	deployment := getCommonDeployment(
+		types.CSIProvisionerName,
+		namespace,
+		serviceAccount,
+		provisionerImage,
+		rootDir,
+		[]string{
+			"--v=2",
+			"--csi-address=$(ADDRESS)",
+			"--timeout=1m50s",
+			"--leader-election",
+			"--leader-election-namespace=$(POD_NAMESPACE)",
+			"--default-fstype=ext4",
+			"--enable-capacity",
+			"--capacity-ownerref-level=2",
+			"--immediate-topology=false",
+			fmt.Sprintf("--kube-api-qps=%v", types.KubeAPIQPS),
+			fmt.Sprintf("--kube-api-burst=%v", types.KubeAPIBurst),
+			fmt.Sprintf("--http-endpoint=:%v", types.CSISidecarMetricsPort),
+		},
+		int32(replicaCount),
+		podAntiAffinityPreset,
+		tolerations,
+		tolerationsString,
+		priorityClass,
+		registrySecret,
+		imagePullPolicy,
+		nodeSelector,
+		[]corev1.ContainerPort{
+			{
+				Name:          types.CSISidecarPortNameProvisioner,
+				ContainerPort: types.CSISidecarMetricsPort,
+			},
+		},
+		resources,
+	)
+
+	return &ProvisionerDeployment{
+		deployment: deployment,
+	}
+}
+
+func (p *ProvisionerDeployment) Deploy(kubeClient *clientset.Clientset) error {
+	return deploy(kubeClient, p.deployment, "deployment",
+		deploymentCreateFunc, deploymentDeleteFunc, deploymentGetFunc, deploymentUpdateFunc)
+}
+
+func (p *ProvisionerDeployment) Cleanup(kubeClient *clientset.Clientset) {
+	if err := cleanup(kubeClient, p.deployment, "deployment",
+		deploymentDeleteFunc, deploymentGetFunc); err != nil {
+		logrus.WithError(err).Warn("Failed to cleanup deployment in provisioner deployment")
+	}
+}
+
+type ResizerDeployment struct {
+	deployment *appsv1.Deployment
+}
+
+func NewResizerDeployment(namespace, serviceAccount, resizerImage, rootDir string, replicaCount int, podAntiAffinityPreset string, tolerations []corev1.Toleration,
+	tolerationsString, priorityClass, registrySecret string, imagePullPolicy corev1.PullPolicy, nodeSelector map[string]string, resources *corev1.ResourceRequirements) *ResizerDeployment {
+
+	deployment := getCommonDeployment(
+		types.CSIResizerName,
+		namespace,
+		serviceAccount,
+		resizerImage,
+		rootDir,
+		[]string{
+			"--v=2",
+			"--csi-address=$(ADDRESS)",
+			"--timeout=1m50s",
+			// Some special volume provisioning methods, like full-copy clone or
+			// restore, take time to pull data from an external source. Before the
+			// data copy finishes, the volume is not ready for workloads.
+			// ControllerExpandVolume will be rejected and retried multiple times
+			// during this period.
+			// Using a small max retry interval helps reduce the volume idle time
+			// after it becomes ready.
+			"--retry-interval-max=1m",
+			"--leader-election",
+			"--leader-election-namespace=$(POD_NAMESPACE)",
+			"--leader-election-namespace=$(POD_NAMESPACE)",
+			fmt.Sprintf("--kube-api-qps=%v", types.KubeAPIQPS),
+			fmt.Sprintf("--kube-api-burst=%v", types.KubeAPIBurst),
+			fmt.Sprintf("--http-endpoint=:%v", types.CSISidecarMetricsPort),
+			// Issue: https://github.com/longhorn/longhorn/issues/3303
+			// TODO: Remove this after upgrading the CSI resizer version that contains the fix of https://github.com/kubernetes-csi/external-resizer/issues/175
+			"--handle-volume-inuse-error=false",
+		},
+		int32(replicaCount),
+		podAntiAffinityPreset,
+		tolerations,
+		tolerationsString,
+		priorityClass,
+		registrySecret,
+		imagePullPolicy,
+		nodeSelector,
+		[]corev1.ContainerPort{
+			{
+				Name:          types.CSISidecarPortNameResizer,
+				ContainerPort: types.CSISidecarMetricsPort,
+			},
+		},
+		resources,
+	)
+
+	return &ResizerDeployment{
+		deployment: deployment,
+	}
+}
+
+func (p *ResizerDeployment) Deploy(kubeClient *clientset.Clientset) error {
+	return deploy(kubeClient, p.deployment, "deployment",
+		deploymentCreateFunc, deploymentDeleteFunc, deploymentGetFunc, deploymentUpdateFunc)
+}
+
+func (p *ResizerDeployment) Cleanup(kubeClient *clientset.Clientset) {
+	if err := cleanup(kubeClient, p.deployment, "deployment",
+		deploymentDeleteFunc, deploymentGetFunc); err != nil {
+		logrus.WithError(err).Warn("Failed to cleanup deployment in resizer deployment")
+	}
+}
+
+type SnapshotterDeployment struct {
+	deployment *appsv1.Deployment
+}
+
+func NewSnapshotterDeployment(namespace, serviceAccount, snapshotterImage, rootDir string, replicaCount int, podAntiAffinityPreset string, tolerations []corev1.Toleration,
+	tolerationsString, priorityClass, registrySecret string, imagePullPolicy corev1.PullPolicy, nodeSelector map[string]string, resources *corev1.ResourceRequirements) *SnapshotterDeployment {
+
+	deployment := getCommonDeployment(
+		types.CSISnapshotterName,
+		namespace,
+		serviceAccount,
+		snapshotterImage,
+		rootDir,
+		[]string{
+			"--v=2",
+			"--csi-address=$(ADDRESS)",
+			"--timeout=1m50s",
+			"--leader-election",
+			"--leader-election-namespace=$(POD_NAMESPACE)",
+			fmt.Sprintf("--kube-api-qps=%v", types.KubeAPIQPS),
+			fmt.Sprintf("--kube-api-burst=%v", types.KubeAPIBurst),
+			fmt.Sprintf("--http-endpoint=:%v", types.CSISidecarMetricsPort),
+		},
+		int32(replicaCount),
+		podAntiAffinityPreset,
+		tolerations,
+		tolerationsString,
+		priorityClass,
+		registrySecret,
+		imagePullPolicy,
+		nodeSelector,
+		[]corev1.ContainerPort{
+			{
+				Name:          types.CSISidecarPortNameSnapshotter,
+				ContainerPort: types.CSISidecarMetricsPort,
+			},
+		},
+		resources,
+	)
+
+	return &SnapshotterDeployment{
+		deployment: deployment,
+	}
+}
+
+func (p *SnapshotterDeployment) Deploy(kubeClient *clientset.Clientset) error {
+	return deploy(kubeClient, p.deployment, "deployment",
+		deploymentCreateFunc, deploymentDeleteFunc, deploymentGetFunc, deploymentUpdateFunc)
+}
+
+func (p *SnapshotterDeployment) Cleanup(kubeClient *clientset.Clientset) {
+	if err := cleanup(kubeClient, p.deployment, "deployment",
+		deploymentDeleteFunc, deploymentGetFunc); err != nil {
+		logrus.WithError(err).Warn("Failed to cleanup deployment in snapshotter deployment")
+	}
+}
+
+type PluginDeployment struct {
+	daemonSet *appsv1.DaemonSet
+}
+
+func NewPluginDeployment(namespace, serviceAccount, nodeDriverRegistrarImage, livenessProbeImage, managerImage, managerURL, rootDir string,
+	tolerations []corev1.Toleration, tolerationsString, priorityClass, registrySecret string, imagePullPolicy corev1.PullPolicy, nodeSelector map[string]string,
+	endpointNetworkForRWXVolumeSetting *longhorn.Setting, resourceLimits *types.ComponentResourceLimits) *PluginDeployment {
+
+	daemonSet := &appsv1.DaemonSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:        types.CSIPluginName,
+			Namespace:   namespace,
+			Annotations: map[string]string{types.GetLonghornLabelKey(types.LastAppliedTolerationAnnotationKeySuffix): tolerationsString},
+			Labels:      types.GetBaseLabelsForSystemManagedComponent(),
+		},
+
+		Spec: appsv1.DaemonSetSpec{
+			Selector: &metav1.LabelSelector{
+				MatchLabels: map[string]string{
+					"app": types.CSIPluginName,
+				},
+			},
+			UpdateStrategy: appsv1.DaemonSetUpdateStrategy{
+				Type: appsv1.RollingUpdateDaemonSetStrategyType,
+				RollingUpdate: &appsv1.RollingUpdateDaemonSet{
+					MaxUnavailable: &intstr.IntOrString{
+						Type:   intstr.Int,
+						IntVal: 1,
+					},
+				},
+			},
+			Template: corev1.PodTemplateSpec{
+				ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{
+						"app": types.CSIPluginName,
+					},
+				},
+				Spec: corev1.PodSpec{
+					ServiceAccountName: serviceAccount,
+					Tolerations:        tolerations,
+					NodeSelector:       nodeSelector,
+					PriorityClassName:  priorityClass,
+					Containers: []corev1.Container{
+						{
+							Name:  "node-driver-registrar",
+							Image: nodeDriverRegistrarImage,
+							Lifecycle: &corev1.Lifecycle{
+								PreStop: &corev1.LifecycleHandler{
+									Exec: &corev1.ExecAction{
+										Command: []string{
+											"/bin/sh", "-c",
+											fmt.Sprintf("rm -rf %s/%s %s/%s-reg.sock %s/*", GetInContainerCSIRegistrationDir(), types.LonghornDriverName, GetInContainerCSIRegistrationDir(), types.LonghornDriverName, GetInContainerCSISocketDir()),
+										},
+									},
+								},
+							},
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: ptr.To(true),
+							},
+							Args: []string{
+								"--v=2",
+								"--csi-address=$(ADDRESS)",
+								"--kubelet-registration-path=" + GetCSISocketFilePath(rootDir),
+							},
+							Env: appendTimezoneEnv([]corev1.EnvVar{
+								{
+									Name:  "ADDRESS",
+									Value: GetInContainerCSISocketFilePath(),
+								},
+							}),
+							ImagePullPolicy: imagePullPolicy,
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "socket-dir",
+									MountPath: GetInContainerCSISocketDir(),
+								},
+								{
+									Name:      "registration-dir",
+									MountPath: GetInContainerCSIRegistrationDir(),
+								},
+							},
+						},
+						{
+							Name:            "longhorn-liveness-probe",
+							ImagePullPolicy: imagePullPolicy,
+							Image:           livenessProbeImage,
+							Args: []string{
+								"--v=4",
+								fmt.Sprintf("--csi-address=%s", GetInContainerCSISocketFilePath()),
+							},
+							Env: appendTimezoneEnv(nil),
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "socket-dir",
+									MountPath: GetInContainerCSISocketDir(),
+								},
+							},
+						},
+						{
+							Name: types.CSIPluginName,
+							SecurityContext: &corev1.SecurityContext{
+								Privileged: ptr.To(true),
+								Capabilities: &corev1.Capabilities{
+									Add: []corev1.Capability{
+										"SYS_ADMIN",
+									},
+								},
+								AllowPrivilegeEscalation: ptr.To(true),
+							},
+							Image:           managerImage,
+							ImagePullPolicy: imagePullPolicy,
+							Ports: []corev1.ContainerPort{
+								{
+									ContainerPort: DefaultCSILivenessProbePort,
+									Protocol:      corev1.ProtocolTCP,
+								},
+							},
+							StartupProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/healthz",
+										Port: intstr.FromInt(DefaultCSILivenessProbePort),
+									},
+								},
+								InitialDelaySeconds: datastore.PodProbeInitialDelay,
+								TimeoutSeconds:      datastore.PodProbeTimeoutSeconds,
+								PeriodSeconds:       datastore.PodProbePeriodSeconds,
+								FailureThreshold:    datastore.PodStartupProbeFailureThreshold,
+							},
+							LivenessProbe: &corev1.Probe{
+								ProbeHandler: corev1.ProbeHandler{
+									HTTPGet: &corev1.HTTPGetAction{
+										Path: "/healthz",
+										Port: intstr.FromInt(DefaultCSILivenessProbePort),
+									},
+								},
+								InitialDelaySeconds: datastore.PodProbeInitialDelay,
+								TimeoutSeconds:      datastore.PodProbeTimeoutSeconds,
+								PeriodSeconds:       datastore.PodProbePeriodSeconds,
+								FailureThreshold:    datastore.PodLivenessProbeFailureThreshold,
+							},
+							Lifecycle: &corev1.Lifecycle{
+								PreStop: &corev1.LifecycleHandler{
+									Exec: &corev1.ExecAction{
+										Command: []string{
+											"/bin/sh", "-c",
+											fmt.Sprintf("rm -f %s/*", GetInContainerCSISocketDir()),
+										},
+									},
+								},
+							},
+							Args: []string{
+								"longhorn-manager",
+								"-d",
+								"csi",
+								"--nodeid=$(NODE_ID)",
+								"--endpoint=$(CSI_ENDPOINT)",
+								fmt.Sprintf("--drivername=%s", types.LonghornDriverName),
+								"--manager-url=" + managerURL,
+							},
+							Env: appendTimezoneEnv([]corev1.EnvVar{
+								{
+									Name: "NODE_ID",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "spec.nodeName",
+										},
+									},
+								},
+								{
+									Name:  "CSI_ENDPOINT",
+									Value: GetCSIEndpoint(),
+								},
+								{
+									Name: "POD_NAMESPACE",
+									ValueFrom: &corev1.EnvVarSource{
+										FieldRef: &corev1.ObjectFieldSelector{
+											FieldPath: "metadata.namespace",
+										},
+									},
+								},
+							}),
+							VolumeMounts: []corev1.VolumeMount{
+								{
+									Name:      "socket-dir",
+									MountPath: GetInContainerCSISocketDir(),
+								},
+								{
+									Name:             "kubernetes-csi-dir",
+									MountPath:        GetCSIKubernetesDir(rootDir),
+									MountPropagation: &MountPropagationBidirectional,
+								},
+								{
+									Name:             "pods-mount-dir",
+									MountPath:        GetCSIPodsDir(rootDir),
+									MountPropagation: &MountPropagationBidirectional,
+								},
+								{
+									Name:      "host-dev",
+									MountPath: "/dev",
+								},
+								{
+									// The plugin must be able to switch to the host's namespaces in order to execute
+									// cryptsetup commands for encrypted devices and to mount RWX volumes when not using
+									// a storage network.
+									Name:      "host-proc",
+									MountPath: "/host/proc",
+								},
+								{
+									Name:      "host-sys",
+									MountPath: "/sys",
+								},
+								{
+									Name:      "lib-modules",
+									MountPath: "/lib/modules",
+									ReadOnly:  true,
+								},
+							},
+						},
+					},
+					Volumes: []corev1.Volume{
+						{
+							Name: "kubernetes-csi-dir",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: GetCSIKubernetesDir(rootDir),
+									Type: &HostPathDirectoryOrCreate,
+								},
+							},
+						},
+						{
+							Name: "registration-dir",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: GetCSIRegistrationDir(rootDir),
+									Type: &HostPathDirectoryOrCreate,
+								},
+							},
+						},
+						{
+							Name: "socket-dir",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: GetCSISocketDir(rootDir),
+									Type: &HostPathDirectoryOrCreate,
+								},
+							},
+						},
+						{
+							Name: "pods-mount-dir",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: GetCSIPodsDir(rootDir),
+									Type: &HostPathDirectoryOrCreate,
+								},
+							},
+						},
+						{
+							Name: "host-dev",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: "/dev",
+								},
+							},
+						},
+						{
+							Name: "host-proc",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: "/proc",
+								},
+							},
+						},
+						{
+							Name: "host-sys",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: "/sys",
+								},
+							},
+						},
+						{
+							Name: "lib-modules",
+							VolumeSource: corev1.VolumeSource{
+								HostPath: &corev1.HostPathVolumeSource{
+									Path: "/lib/modules",
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+
+	if registrySecret != "" {
+		daemonSet.Spec.Template.Spec.ImagePullSecrets = []corev1.LocalObjectReference{
+			{
+				Name: registrySecret,
+			},
+		}
+	}
+	types.AddGoCoverDirToDaemonSet(daemonSet)
+
+	types.UpdateDaemonSetTemplateBasedOnCNISettings(daemonSet, endpointNetworkForRWXVolumeSetting)
+
+	// Set resources for each container if provided
+	if resourceLimits != nil {
+		for i, container := range daemonSet.Spec.Template.Spec.Containers {
+			var containerResources *corev1.ResourceRequirements
+
+			switch container.Name {
+			case "node-driver-registrar":
+				containerResources = resourceLimits.CSINodeDriverRegistrar
+			case "longhorn-liveness-probe":
+				containerResources = resourceLimits.CSILivenessProbe
+			case types.CSIPluginName: // "longhorn-csi-plugin"
+				containerResources = resourceLimits.CSIPlugin
+			}
+
+			if containerResources != nil {
+				daemonSet.Spec.Template.Spec.Containers[i].Resources = *containerResources
+			}
+		}
+	}
+
+	return &PluginDeployment{
+		daemonSet: daemonSet,
+	}
+}
+
+func (p *PluginDeployment) Deploy(kubeClient *clientset.Clientset) error {
+	return deploy(kubeClient, p.daemonSet, "daemon set",
+		daemonSetCreateFunc, daemonSetDeleteFunc, daemonSetGetFunc, nil)
+}
+
+func (p *PluginDeployment) Cleanup(kubeClient *clientset.Clientset) {
+	if err := cleanup(kubeClient, p.daemonSet, "daemon set",
+		daemonSetDeleteFunc, daemonSetGetFunc); err != nil {
+		logrus.WithError(err).Warn("Failed to cleanup DaemonSet in plugin deployment")
+	}
+}
+
+type DriverObjectDeployment struct {
+	obj *storagev1.CSIDriver
+}
+
+func NewCSIDriverObject(storageCapacityEnabled bool) *DriverObjectDeployment {
+	obj := &storagev1.CSIDriver{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: types.LonghornDriverName,
+		},
+		Spec: storagev1.CSIDriverSpec{
+			PodInfoOnMount:  ptr.To(true),
+			StorageCapacity: ptr.To(storageCapacityEnabled),
+		},
+	}
+	return &DriverObjectDeployment{
+		obj: obj,
+	}
+}
+
+func (d *DriverObjectDeployment) Deploy(kubeClient *clientset.Clientset) error {
+	return deploy(kubeClient, d.obj, "CSI Driver",
+		csiDriverObjectCreateFunc, csiDriverObjectDeleteFunc, csiDriverObjectGetFunc, nil)
+}
+
+func (d *DriverObjectDeployment) Cleanup(kubeClient *clientset.Clientset) {
+	if err := cleanup(kubeClient, d.obj, "CSI Driver",
+		csiDriverObjectDeleteFunc, csiDriverObjectGetFunc); err != nil {
+		logrus.WithError(err).Warn("Failed to cleanup CSI Driver object in CSI Driver object deployment")
+	}
+}

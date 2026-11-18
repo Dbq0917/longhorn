@@ -1,0 +1,69 @@
+package types
+
+import (
+	"fmt"
+
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+)
+
+const (
+	VolumeOperationGeneric       = "generic"
+	VolumeOperationSizeExpansion = "size-expansion"
+)
+
+func IsVolumeReady(v *longhorn.Volume, vrs []*longhorn.Replica, volOp string) (ready bool, msg string) {
+	// EC (sharded) volumes use ShardGroup/Shard CRs instead of Replica CRs, so an
+	// empty replica list is expected and must not block readiness.
+	allReplicaScheduled := v.Spec.DataLayout.Type == longhorn.VolumeDataLayoutTypeSharded || len(vrs) > 0
+	for _, r := range vrs {
+		if r.Spec.NodeID == "" {
+			allReplicaScheduled = false
+		}
+	}
+	scheduledCondition := GetCondition(v.Status.Conditions, longhorn.VolumeConditionTypeScheduled)
+	isCloningDesired := IsDataFromVolume(v.Spec.DataSource)
+	isCloneStateCompleted := v.Status.CloneStatus.State == longhorn.VolumeCloneStateCompleted
+	isCloneStateCopyCompletedAwaitingHealthy := v.Status.CloneStatus.State == longhorn.VolumeCloneStateCopyCompletedAwaitingHealthy
+	if v.Spec.NodeID == "" && v.Status.State != longhorn.VolumeStateDetached {
+		return false, fmt.Sprintf("waiting for the volume to fully detach. current state: %v", v.Status.State)
+	}
+	if v.Status.State == longhorn.VolumeStateDetached && scheduledCondition.Status != longhorn.ConditionStatusTrue && !allReplicaScheduled {
+		return false, "volume is currently in detached state with some un-schedulable replicas"
+	}
+	if v.Status.Robustness == longhorn.VolumeRobustnessFaulted {
+		return false, "volume is faulted"
+	}
+	if isCloningDesired && !isCloneStateCompleted && !isCloneStateCopyCompletedAwaitingHealthy {
+		return false, "volume request cloning data but has not finished copying data"
+	}
+	switch volOp {
+	case VolumeOperationSizeExpansion:
+		// Allow DR volumes (standby) to expand even when RestoreRequired is true.
+		// Block non-DR volumes that are still restoring from backup.
+		if v.Status.RestoreRequired && !v.Status.IsStandby {
+			return false, "cannot expand size: volume is restoring data from backup"
+		}
+	case VolumeOperationGeneric:
+		fallthrough
+	default:
+		// For all other operations, disallow when restore is required.
+		if v.Status.RestoreRequired {
+			return false, "volume requires restoration"
+		}
+	}
+	return true, ""
+}
+
+// IsVolumeV2EncryptedVolumeWithLuksHeaderLabelTrue returns true if the volume has the label LonghornLabelV2EncryptedVolumeWithLuksHeader set to "true".
+func IsVolumeV2EncryptedVolumeWithLuksHeaderLabelTrue(v *longhorn.Volume) bool {
+	if !IsDataEngineV2(v.Spec.DataEngine) || !v.Spec.Encrypted || v.Labels == nil {
+		return false
+	}
+
+	luksExtendedLabel, ok := v.Labels[LonghornLabelV2EncryptedVolumeWithLuksHeader]
+	if !ok {
+		return false
+	}
+
+	return luksExtendedLabel == longhorn.TrueValue
+}

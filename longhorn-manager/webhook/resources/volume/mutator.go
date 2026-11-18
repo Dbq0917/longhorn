@@ -1,0 +1,530 @@
+package volume
+
+import (
+	"fmt"
+	"strconv"
+
+	"github.com/cockroachdb/errors"
+	"github.com/sirupsen/logrus"
+
+	"k8s.io/apimachinery/pkg/runtime"
+
+	admissionregv1 "k8s.io/api/admissionregistration/v1"
+
+	"github.com/longhorn/backupstore"
+
+	"github.com/longhorn/longhorn-manager/datastore"
+	"github.com/longhorn/longhorn-manager/types"
+	"github.com/longhorn/longhorn-manager/util"
+	"github.com/longhorn/longhorn-manager/webhook/admission"
+	"github.com/longhorn/longhorn-manager/webhook/common"
+
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	werror "github.com/longhorn/longhorn-manager/webhook/error"
+)
+
+type volumeMutator struct {
+	admission.DefaultMutator
+	ds *datastore.DataStore
+}
+
+func NewMutator(ds *datastore.DataStore) admission.Mutator {
+	return &volumeMutator{ds: ds}
+}
+
+func (v *volumeMutator) Resource() admission.Resource {
+	return admission.Resource{
+		Name:       "volumes",
+		Scope:      admissionregv1.NamespacedScope,
+		APIGroup:   longhorn.SchemeGroupVersion.Group,
+		APIVersion: longhorn.SchemeGroupVersion.Version,
+		ObjectType: &longhorn.Volume{},
+		OperationTypes: []admissionregv1.OperationType{
+			admissionregv1.Create,
+			admissionregv1.Update,
+		},
+	}
+}
+
+func (v *volumeMutator) areAllDefaultInstanceManagersStopped(defaultInstanceManagerImage string) (bool, error) {
+	ims, err := v.ds.ListInstanceManagersBySelectorRO("", defaultInstanceManagerImage, longhorn.InstanceManagerTypeAllInOne, longhorn.DataEngineTypeV2)
+	if err != nil {
+		return false, errors.Wrap(err, "failed to list instance managers")
+	}
+
+	for _, im := range ims {
+		if im.Status.CurrentState != longhorn.InstanceManagerStateStopped {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+func (v *volumeMutator) getActiveInstanceManagerImage(defaultInstanceManagerImage string) (string, error) {
+	// Check whether all default instance managers are stopped.
+	// If all default instance managers are stopped, we can use the current active instance manager image.
+	// If not, we use the default instance manager image because system is in the middle of upgrade.
+	allStopped, err := v.areAllDefaultInstanceManagersStopped(defaultInstanceManagerImage)
+	if err != nil {
+		return "", errors.Wrap(err, "failed to check whether all default instance managers are stopped")
+	}
+
+	if allStopped {
+		// Get the active instance manager image from the non-default instance manager.
+		ims, err := v.ds.ListInstanceManagersBySelectorRO("", "", longhorn.InstanceManagerTypeAllInOne, longhorn.DataEngineTypeV2)
+		if err != nil {
+			return "", errors.Wrap(err, "failed to list instance managers")
+		}
+		for _, im := range ims {
+			if im.Spec.Image != defaultInstanceManagerImage {
+				return im.Spec.Image, nil
+			}
+		}
+	}
+
+	return defaultInstanceManagerImage, nil
+}
+
+func (v *volumeMutator) Create(request *admission.Request, newObj runtime.Object) (admission.PatchOps, error) {
+	volume, ok := newObj.(*longhorn.Volume)
+	if !ok {
+		return nil, werror.NewInvalidError(fmt.Sprintf("%v is not a *longhorn.Volume", newObj), "")
+	}
+	var patchOps admission.PatchOps
+
+	name := util.AutoCorrectName(volume.Name, datastore.NameMaximumLength)
+	if name != volume.Name {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/metadata/name", "value": "%s"}`, name))
+	}
+
+	if volume.Spec.NumberOfReplicas == 0 {
+		// EC (sharded) volumes require exactly one replica; fault tolerance comes from
+		// parity chunks, so the validator rejects any other count.
+		numberOfReplicas := 1
+		if volume.Spec.DataLayout.Type != longhorn.VolumeDataLayoutTypeSharded {
+			count, err := v.getDefaultReplicaCount(volume.Spec.DataEngine)
+			if err != nil {
+				return nil, werror.NewInvalidError(errors.Wrap(err, "failed to get valid number for setting default replica count").Error(), "")
+			}
+			numberOfReplicas = count
+			logrus.Infof("Using the default number of replicas %v", numberOfReplicas)
+		}
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/numberOfReplicas", "value": %v}`, numberOfReplicas))
+	}
+
+	if string(volume.Spec.DataLocality) == "" {
+		// EC (sharded) volumes distribute chunks across k+m nodes, so the validator
+		// requires data locality disabled regardless of the cluster default.
+		dataLocality := string(longhorn.DataLocalityDisabled)
+		if volume.Spec.DataLayout.Type != longhorn.VolumeDataLayoutTypeSharded {
+			setting, err := v.ds.GetSettingValueExisted(types.SettingNameDefaultDataLocality)
+			if err != nil {
+				return nil, werror.NewInvalidError(errors.Wrapf(err, "failed to get valid mode for setting default data locality for volume: %v", name).Error(), "")
+			}
+			dataLocality = setting
+		}
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/dataLocality", "value": "%s"}`, dataLocality))
+	}
+
+	if string(volume.Spec.AccessMode) == "" {
+		accessModeFromBackup := longhorn.AccessModeReadWriteOnce
+		if volume.Spec.FromBackup != "" {
+			bName, _, _, err := backupstore.DecodeBackupURL(volume.Spec.FromBackup)
+			if err != nil {
+				err := errors.Wrapf(err, "failed to decode backup url %v", volume.Spec.FromBackup)
+				return nil, werror.NewInvalidError(err.Error(), "")
+			}
+			backup, err := v.ds.GetBackupRO(bName)
+			if err != nil {
+				err = errors.Wrapf(err, "failed to get backup %v", bName)
+				return nil, werror.NewInvalidError(err.Error(), "")
+			}
+			if labelAccessMode, isExist := backup.Status.Labels[types.GetLonghornLabelKey(types.LonghornLabelVolumeAccessMode)]; isExist {
+				accessModeFromBackup = longhorn.AccessMode(labelAccessMode)
+			}
+		}
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/accessMode", "value": "%s"}`, string(accessModeFromBackup)))
+	}
+
+	moreLabels := map[string]string{}
+
+	// Use a new label to indicate that the volume is a v2 encrypted volume and LUKS2 header size can be extended.
+	// Existing v2 encrypted volumes that are created before (v1.12.1) the introduction of this label will not have this label.
+	if volume.Spec.Encrypted && types.IsDataEngineV2(volume.Spec.DataEngine) {
+		moreLabels[types.LonghornLabelV2EncryptedVolumeWithLuksHeader] = longhorn.TrueValue
+	}
+
+	size := volume.Spec.Size
+	backupTargetName := volume.Spec.BackupTargetName
+	if volume.Spec.FromBackup != "" {
+		bName, canonicalBVName, _, err := backupstore.DecodeBackupURL(volume.Spec.FromBackup)
+		if err != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("cannot get backup and volume name from backup URL %v: %v", volume.Spec.FromBackup, err), "")
+		}
+
+		backup, err := v.ds.GetBackupRO(bName)
+		if err != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("cannot get backup %s: %v", bName, err), "")
+		}
+		backupTargetName = backup.Status.BackupTargetName
+
+		bv, err := v.ds.GetBackupVolumeByBackupTargetAndVolumeRO(backupTargetName, canonicalBVName)
+		if err != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("cannot get backup volume for backup target %s and volume %s: %v", backupTargetName, canonicalBVName, err), "")
+		}
+
+		if bv != nil && backup != nil && backup.Status.VolumeBackingImageName != "" {
+			if bv.Status.BackingImageName != backup.Status.VolumeBackingImageName {
+				err = fmt.Errorf("backup volume's backing image %v does not match backup's backing image %v. The backup volume resource is being updated and please retry later", bv.Status.BackingImageName, backup.Status.VolumeBackingImageName)
+				return nil, werror.NewForbiddenError(err.Error())
+			}
+
+			if volume.Spec.BackingImage == "" {
+				volume.Spec.BackingImage = bv.Status.BackingImageName
+				patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/backingImage", "value": "%s"}`, bv.Status.BackingImageName))
+				logrus.Debugf("Since the backing image is not specified during the restore, "+
+					"the previous backing image %v used by backup volume %v will be set for volume %v creation",
+					bv.Status.BackingImageName, canonicalBVName, name)
+			}
+			bi, err := v.ds.GetBackingImage(volume.Spec.BackingImage)
+			if err != nil {
+				err = errors.Wrapf(err, "failed to get backing image %v", volume.Spec.BackingImage)
+				return nil, werror.NewInvalidError(err.Error(), "")
+			}
+			// Validate the checksum only when the chosen backing image name is the same as the record in the backup volume.
+			// If user picks up a backing image different from `backupVolume.BackingImageName`, there is no need to do verification.
+			if volume.Spec.BackingImage == bv.Status.BackingImageName {
+				if bv.Status.BackingImageChecksum != "" && bi.Status.Checksum != "" &&
+					bv.Status.BackingImageChecksum != bi.Status.Checksum {
+					return nil, werror.NewInvalidError(fmt.Sprintf("backing image %v current checksum doesn't match the recoreded checksum in backup volume", volume.Spec.BackingImage), "")
+				}
+			}
+		}
+
+		// Volumes restored from backup should not have the label LonghornLabelV2EncryptedVolumeWithLuksHeader set to "true" because they are not extended.
+		if volume.Spec.Encrypted && types.IsDataEngineV2(volume.Spec.DataEngine) {
+			if backup == nil || backup.Status.Labels == nil {
+				delete(moreLabels, types.LonghornLabelV2EncryptedVolumeWithLuksHeader)
+			} else {
+				if encrypted, exists := backup.Status.Labels[types.LonghornLabelVolumeEncrypted]; !exists || encrypted != types.LonghornLabelValueEnabled {
+					delete(moreLabels, types.LonghornLabelV2EncryptedVolumeWithLuksHeader)
+				}
+			}
+		}
+
+		currentBackupVolumeSize := backup.Status.VolumeSize
+		if bv != nil && bv.Status.Size != "" {
+			currentBackupVolumeSize = bv.Status.Size
+		}
+		logrus.Infof("Override size of volume %v to %v because it's from backup", name, currentBackupVolumeSize)
+		// formalize the final size to the unit in bytes
+		size, err = util.ConvertSize(currentBackupVolumeSize)
+		if err != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("get invalid size for volume %v: %v", currentBackupVolumeSize, err), "")
+		}
+
+		moreLabels[types.LonghornLabelBackupVolume] = canonicalBVName
+	}
+	if backupTargetName == "" {
+		backupTargetName = types.DefaultBackupTargetName
+	}
+	moreLabels[types.LonghornLabelBackupTarget] = backupTargetName
+	patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/backupTargetName", "value": "%s"}`, backupTargetName))
+
+	// For linked-clone volumes, fill spec.size from the source snapshot RestoreSize
+	// when the user leaves it unset. The validator rejects explicit sizes that do
+	// not match.
+	if volume.Spec.CloneMode == longhorn.CloneModeLinkedClone && volume.Spec.DataSource != "" && size == 0 {
+		srcVolName := types.GetVolumeName(volume.Spec.DataSource)
+		if srcVolName == "" {
+			return nil, werror.NewInvalidError(fmt.Sprintf("cannot parse source volume name from dataSource %v", volume.Spec.DataSource), ".spec.dataSource")
+		}
+		if snapName := types.GetSnapshotName(volume.Spec.DataSource); snapName != "" {
+			if snap, snapErr := v.ds.GetSnapshotRO(snapName); snapErr == nil && snap.Status.RestoreSize > 0 {
+				size = snap.Status.RestoreSize
+			}
+		}
+		if size == 0 {
+			// RestoreSize not yet synced; fall back to the source volume spec.size.
+			srcVol, srcErr := v.ds.GetVolumeRO(srcVolName)
+			if srcErr != nil {
+				return nil, werror.NewInvalidError(errors.Wrapf(srcErr, "failed to get source volume %v", srcVolName).Error(), ".spec.dataSource")
+			}
+			size = srcVol.Spec.Size
+		}
+	}
+
+	// Round up the size to the unit in bytes
+	newSize := util.RoundUpSize(size)
+	if newSize != size {
+		logrus.Infof("Rounding up the volume spec size from %d to %d in the create mutator", size, newSize)
+	}
+	patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/size", "value": "%v"}`, strconv.FormatInt(newSize, 10)))
+
+	// Mutate the image to the default one
+	defaultImageSetting := types.SettingNameDefaultEngineImage
+	if types.IsDataEngineV2(volume.Spec.DataEngine) {
+		defaultImageSetting = types.SettingNameDefaultInstanceManagerImage
+	}
+	defaultImage, _ := v.ds.GetSettingValueExisted(defaultImageSetting)
+	if defaultImage == "" {
+		return nil, werror.NewInvalidError(fmt.Sprintf("invalid empty setting %s", defaultImageSetting), "")
+	}
+	if types.IsDataEngineV2(volume.Spec.DataEngine) {
+		activeInstanceManagerImage, err := v.getActiveInstanceManagerImage(defaultImage)
+		if err != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("failed to get active instance manager image for volume %v: %v", name, err), "")
+		}
+		defaultImage = activeInstanceManagerImage
+	}
+
+	patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/image", "value": "%s"}`, defaultImage))
+
+	// Mutate the backup compression method to the default one
+	if volume.Spec.BackupCompressionMethod == "" {
+		defaultCompressionMethod, _ := v.ds.GetSettingValueExisted(types.SettingNameBackupCompressionMethod)
+		if defaultCompressionMethod == "" {
+			return nil, werror.NewInvalidError("BUG: Invalid empty Setting.BackupCompressionMethod", "")
+		}
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/backupCompressionMethod", "value": "%s"}`, defaultCompressionMethod))
+	}
+
+	if volume.Spec.SnapshotMaxCount == 0 {
+		snapshotMaxCount, err := v.getSnapshotMaxCount()
+		if err != nil {
+			err = errors.Wrap(err, "failed to get valid number for setting snapshot max count")
+			return nil, werror.NewInvalidError(err.Error(), "")
+		}
+		logrus.Infof("Using the default snapshot max count %v", snapshotMaxCount)
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/snapshotMaxCount", "value": %v}`, snapshotMaxCount))
+	}
+
+	if volume.Spec.DataLocality == longhorn.DataLocalityStrictLocal {
+		patchOps = append(patchOps, `{"op": "replace", "path": "/spec/revisionCounterDisabled", "value": true}`)
+	}
+
+	if volume.Spec.DataSource != "" {
+		if volume.Spec.CloneMode == longhorn.CloneModeNone {
+			patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/cloneMode", "value": "%s"}`, longhorn.CloneModeFullCopy))
+		}
+		// Stamp clone source volume label for all clone types (full-copy and linked-clone).
+		if types.IsDataFromVolume(volume.Spec.DataSource) {
+			if srcVolName := types.GetVolumeName(volume.Spec.DataSource); srcVolName != "" {
+				moreLabels[types.GetLonghornLabelKey(types.LonghornLabelCloneSourceVolume)] = srcVolName
+			}
+		}
+		if volume.Spec.CloneMode == longhorn.CloneModeLinkedClone {
+			// Stamp source labels so the deletion webhook can protect the entrypoint
+			// snapshot. For vol:// datasources the snapshot is auto-created later
+			// and its label is stamped by the volume controller.
+			if snapName := types.GetSnapshotName(volume.Spec.DataSource); snapName != "" {
+				moreLabels[types.GetLonghornLabelKey(types.LonghornLabelLinkedCloneSourceSnapshot)] = snapName
+			}
+		}
+	}
+
+	var patchOpsInCommon admission.PatchOps
+	var err error
+	if patchOpsInCommon, err = v.mutate(newObj, moreLabels); err != nil {
+		return nil, err
+	}
+	patchOps = append(patchOps, patchOpsInCommon...)
+
+	return patchOps, nil
+}
+
+func (v *volumeMutator) Update(request *admission.Request, oldObj runtime.Object, newObj runtime.Object) (admission.PatchOps, error) {
+	oldVolume, ok := oldObj.(*longhorn.Volume)
+	if !ok {
+		return nil, werror.NewInvalidError(fmt.Sprintf("%v is not a *longhorn.Volume", oldObj), "")
+	}
+	volume, ok := newObj.(*longhorn.Volume)
+	if !ok {
+		return nil, werror.NewInvalidError(fmt.Sprintf("%v is not a *longhorn.Volume", newObj), "")
+	}
+	var patchOps admission.PatchOps
+
+	if volume.Spec.AccessMode == "" {
+		patchOps = append(patchOps, `{"op": "replace", "path": "/spec/accessMode", "value": "rwo"}`)
+	}
+
+	size := util.RoundUpSize(volume.Spec.Size)
+	if size != volume.Spec.Size {
+		logrus.Infof("Rounding up the requested volume spec size from %d to %d in the update mutator", volume.Spec.Size, size)
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/size", "value": "%s"}`, strconv.FormatInt(size, 10)))
+	}
+
+	if string(volume.Spec.BackupCompressionMethod) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/backupCompressionMethod", "value": "%s"}`, longhorn.BackupCompressionMethodGzip))
+	}
+
+	if volume.Spec.SnapshotMaxCount == 0 {
+		snapshotMaxCount, err := v.getSnapshotMaxCount()
+		if err != nil {
+			err = errors.Wrap(err, "failed to get valid number for setting snapshot max count")
+			return nil, werror.NewInvalidError(err.Error(), "")
+		}
+		logrus.Infof("Using the default snapshot max count %v", snapshotMaxCount)
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/snapshotMaxCount", "value": %v}`, snapshotMaxCount))
+	}
+
+	// if user expand volume size, we don't want snapshotMaxSize < size*2 blocks the change
+	if oldVolume.Spec.Size != volume.Spec.Size && volume.Spec.SnapshotMaxSize != 0 && volume.Spec.SnapshotMaxSize < volume.Spec.Size*2 {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/snapshotMaxSize", "value": "%s"}`, strconv.FormatInt(volume.Spec.Size*2, 10)))
+	}
+
+	if volume.Spec.DataSource != "" && volume.Spec.CloneMode == longhorn.CloneModeNone {
+		newCloneMode := longhorn.CloneModeFullCopy
+		if oldVolume.Spec.CloneMode != longhorn.CloneModeNone {
+			newCloneMode = oldVolume.Spec.CloneMode
+		}
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/cloneMode", "value": "%s"}`, newCloneMode))
+	}
+
+	moreLabels := map[string]string{}
+	if oldVolume.Spec.BackupTargetName != volume.Spec.BackupTargetName {
+		moreLabels[types.LonghornLabelBackupTarget] = volume.Spec.BackupTargetName
+	}
+
+	var patchOpsInCommon admission.PatchOps
+	var err error
+	if patchOpsInCommon, err = v.mutate(newObj, moreLabels); err != nil {
+		return nil, err
+	}
+	patchOps = append(patchOps, patchOpsInCommon...)
+
+	return patchOps, nil
+}
+
+// mutate contains functionality shared by Create and Update.
+// Unlike mutate for other resources, this mutate takes a moreLabels map, as Create may want to add some.
+func (v *volumeMutator) mutate(newObj runtime.Object, moreLabels map[string]string) (admission.PatchOps, error) {
+	volume := newObj.(*longhorn.Volume)
+	var patchOps admission.PatchOps
+
+	patchOp, err := common.GetLonghornFinalizerPatchOpIfNeeded(volume)
+	if err != nil {
+		err := errors.Wrapf(err, "failed to get finalizer patch for volume %v", volume.Name)
+		return nil, werror.NewInvalidError(err.Error(), "")
+	}
+	if patchOp != "" {
+		patchOps = append(patchOps, patchOp)
+	}
+
+	if volume.Spec.ReplicaAutoBalance == "" {
+		patchOps = append(patchOps, `{"op": "replace", "path": "/spec/replicaAutoBalance", "value": "ignored"}`)
+	}
+	if volume.Spec.DiskSelector == nil {
+		patchOps = append(patchOps, `{"op": "replace", "path": "/spec/diskSelector", "value": []}`)
+	}
+	if volume.Spec.NodeSelector == nil {
+		patchOps = append(patchOps, `{"op": "replace", "path": "/spec/nodeSelector", "value": []}`)
+	}
+	if string(volume.Spec.SnapshotDataIntegrity) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/snapshotDataIntegrity", "value": "%s"}`, longhorn.SnapshotDataIntegrityIgnored))
+	}
+	if string(volume.Spec.RestoreVolumeRecurringJob) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/restoreVolumeRecurringJob", "value": "%s"}`, longhorn.RestoreVolumeRecurringJobDefault))
+	}
+	if types.IsDataEngineV2(volume.Spec.DataEngine) {
+		// The field is not meaningful for v2 volumes
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/unmapMarkSnapChainRemoved", "value": "%s"}`, longhorn.UnmapMarkSnapChainRemovedDisabled))
+	} else {
+		if volume.Spec.UnmapMarkSnapChainRemoved == "" {
+			patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/unmapMarkSnapChainRemoved", "value": "%s"}`, longhorn.UnmapMarkSnapChainRemovedIgnored))
+		}
+	}
+	if string(volume.Spec.ReplicaSoftAntiAffinity) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/replicaSoftAntiAffinity", "value": "%s"}`, longhorn.ReplicaSoftAntiAffinityDefault))
+	}
+	if string(volume.Spec.ReplicaZoneSoftAntiAffinity) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/replicaZoneSoftAntiAffinity", "value": "%s"}`, longhorn.ReplicaZoneSoftAntiAffinityDefault))
+	}
+	if string(volume.Spec.ReplicaDiskSoftAntiAffinity) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/replicaDiskSoftAntiAffinity", "value": "%s"}`, longhorn.ReplicaDiskSoftAntiAffinityDefault))
+	}
+	if string(volume.Spec.DataEngine) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/dataEngine", "value": "%s"}`, longhorn.DataEngineTypeV1))
+	}
+	if string(volume.Spec.FreezeFilesystemForSnapshot) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/freezeFilesystemForSnapshot", "value": "%s"}`, longhorn.FreezeFilesystemForSnapshotDefault))
+	}
+	if string(volume.Spec.OfflineRebuilding) == "" {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/offlineRebuilding", "value": "%s"}`, longhorn.VolumeOfflineRebuildingIgnored))
+	}
+
+	var backupBlockSize = volume.Spec.BackupBlockSize
+	if volume.Spec.Standby {
+		// The backup block size of a DR volume is always copied from the latest backup
+		bName, _, _, err := backupstore.DecodeBackupURL(volume.Spec.FromBackup)
+		if err != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("failed to get backup name from backup URL %s: %s", volume.Spec.FromBackup, err.Error()), "spec.fromBackup")
+		}
+		backup, err := v.ds.GetBackupRO(bName)
+		if err != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("failed to inspect the backup config %s: %s", volume.Spec.FromBackup, err.Error()), "spec.fromBackup")
+		}
+		backupBlockSize = backup.Spec.BackupBlockSize
+		if backupBlockSize == 0 {
+			// fall back to legacy default 2 MiB
+			backupBlockSize = types.BackupBlockSize2Mi
+		}
+	} else if backupBlockSize == 0 {
+		// For non-DR volumes, mutate the backup block size to the default one if not set
+		defaultBackupBlockSize, settingErr := v.getDefaultBackupBlockSize()
+		if settingErr != nil {
+			return nil, werror.NewInvalidError(fmt.Sprintf("invalid default backup block size setting: %s", settingErr.Error()), "")
+		}
+		backupBlockSize = defaultBackupBlockSize
+	}
+	if backupBlockSize != volume.Spec.BackupBlockSize {
+		patchOps = append(patchOps, fmt.Sprintf(`{"op": "replace", "path": "/spec/backupBlockSize", "value": "%d"}`, backupBlockSize))
+	}
+
+	labels := volume.Labels
+	if labels == nil {
+		labels = map[string]string{}
+	}
+	for k, v := range moreLabels {
+		labels[k] = v
+	}
+	labelsForVolumesFollowsGlobalSettings := datastore.GetLabelsForVolumesFollowsGlobalSettings(volume)
+	for k, v := range labelsForVolumesFollowsGlobalSettings {
+		labels[k] = v
+	}
+	patchOp, err = common.GetLonghornLabelsPatchOp(volume, labels, types.SettingsRelatedToVolume)
+	if err != nil {
+		err := errors.Wrapf(err, "failed to get label patch for volume %v", volume.Name)
+		return nil, werror.NewInvalidError(err.Error(), "")
+	}
+	patchOps = append(patchOps, patchOp)
+
+	return patchOps, nil
+}
+
+func (v *volumeMutator) getDefaultReplicaCount(dataEngine longhorn.DataEngineType) (int, error) {
+	c, err := v.ds.GetSettingAsIntByDataEngine(types.SettingNameDefaultReplicaCount, dataEngine)
+	if err != nil {
+		return 0, err
+	}
+	return int(c), nil
+}
+
+func (v *volumeMutator) getSnapshotMaxCount() (int, error) {
+	c, err := v.ds.GetSettingAsInt(types.SettingNameSnapshotMaxCount)
+	if err != nil {
+		return 0, err
+	}
+	return int(c), nil
+}
+
+func (v *volumeMutator) getDefaultBackupBlockSize() (int64, error) {
+	sizeMB, err := v.ds.GetSettingAsInt(types.SettingNameDefaultBackupBlockSize)
+	if err != nil {
+		return 0, err
+	}
+	if sizeMB == 0 {
+		return types.BackupBlockSize2Mi, nil
+	}
+	return sizeMB * types.BackupBlockSizeMi, nil
+}

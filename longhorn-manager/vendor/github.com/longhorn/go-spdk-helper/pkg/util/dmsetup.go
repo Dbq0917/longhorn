@@ -1,0 +1,263 @@
+package util
+
+import (
+	"fmt"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	commonns "github.com/longhorn/go-common-libs/ns"
+
+	"github.com/longhorn/go-spdk-helper/pkg/types"
+)
+
+const (
+	dmsetupBinary = "dmsetup"
+
+	// noUdevSyncOption stops dmsetup from waiting for udev to publish the node change.
+	// udev blocks when a backing device stops responding, and the wait would then
+	// outlast a command whose ioctl has already succeeded, reporting a failure for
+	// work that was done. The nodes are reconciled with mknodes instead.
+	noUdevSyncOption = "--noudevsync"
+)
+
+// DmsetupCreate creates a device mapper device with the given name and table
+func DmsetupCreate(dmDeviceName, table string, executor *commonns.Executor) error {
+	opts := []string{
+		noUdevSyncOption, "create", dmDeviceName, "--table", table,
+	}
+	_, err := executor.Execute(nil, dmsetupBinary, opts, types.DmsetupTimeout)
+	return err
+}
+
+// DmsetupSuspend suspends the device mapper device with the given name
+func DmsetupSuspend(dmDeviceName string, noflush, nolockfs bool, timeout time.Duration, executor *commonns.Executor) error {
+	opts := []string{
+		"suspend", dmDeviceName,
+	}
+
+	if noflush {
+		opts = append(opts, "--noflush")
+	}
+
+	if nolockfs {
+		opts = append(opts, "--nolockfs")
+	}
+
+	_, err := executor.Execute(nil, dmsetupBinary, opts, timeout)
+	return err
+}
+
+// DmsetupResume resumes the suspended device mapper device with the given name
+func DmsetupResume(dmDeviceName string, timeout time.Duration, executor *commonns.Executor) error {
+	opts := []string{
+		"resume", dmDeviceName,
+	}
+	_, err := executor.Execute(nil, dmsetupBinary, opts, timeout)
+	return err
+}
+
+// DmsetupReload reloads the table of the device mapper device with the given name and table
+func DmsetupReload(dmDeviceName, table string, timeout time.Duration, executor *commonns.Executor) error {
+	opts := []string{
+		"reload", dmDeviceName, "--table", table,
+	}
+	_, err := executor.Execute(nil, dmsetupBinary, opts, timeout)
+	return err
+}
+
+// DmsetupRemove removes the device mapper device with the given name
+func DmsetupRemove(dmDeviceName string, force, deferred bool, executor *commonns.Executor) error {
+	opts := []string{
+		noUdevSyncOption, "remove", dmDeviceName,
+	}
+	if force {
+		opts = append(opts, "--force")
+	}
+	if deferred {
+		opts = append(opts, "--deferred")
+	}
+	_, err := executor.Execute(nil, dmsetupBinary, opts, types.DmsetupTimeout)
+	return err
+}
+
+// DmsetupMknodes reconciles the /dev/mapper nodes with what device-mapper reports.
+// An empty name covers every device, which is how a node left behind by a removal is
+// dropped now that dmsetup does not wait for udev to do it.
+func DmsetupMknodes(dmDeviceName string, executor *commonns.Executor) error {
+	opts := []string{
+		"mknodes",
+	}
+	if dmDeviceName != "" {
+		opts = append(opts, dmDeviceName)
+	}
+	_, err := executor.Execute(nil, dmsetupBinary, opts, types.DmsetupTimeout)
+	return err
+}
+
+// DmsetupDeps returns the dependent devices of the device mapper device with the given name
+func DmsetupDeps(dmDeviceName string, executor *commonns.Executor) ([]string, error) {
+	opts := []string{
+		"deps", dmDeviceName, "-o", "devname",
+	}
+
+	outputStr, err := executor.Execute(nil, dmsetupBinary, opts, types.DmsetupTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	knownDevices, err := GetKnownDevices(executor)
+	if err != nil {
+		return nil, err
+	}
+
+	return parseDependentDevicesFromString(outputStr, knownDevices), nil
+}
+
+func parseDependentDevicesFromString(str string, knownDevices map[string]*LonghornBlockDevice) []string {
+	re := regexp.MustCompile(`\(([^)]+)\)`)
+	matches := re.FindAllStringSubmatch(str, -1)
+
+	devices := make([]string, 0, len(matches))
+
+	for _, match := range matches {
+		dep := strings.TrimSpace(match[1])
+		if dep == "" {
+			continue
+		}
+
+		if !strings.Contains(dep, ",") {
+			devices = append(devices, dep)
+			continue
+		}
+
+		majorMinor := strings.Split(dep, ",")
+		if len(majorMinor) != 2 {
+			continue
+		}
+
+		major, errMajor := strconv.Atoi(strings.TrimSpace(majorMinor[0]))
+		minor, errMinor := strconv.Atoi(strings.TrimSpace(majorMinor[1]))
+		if errMajor != nil || errMinor != nil {
+			continue
+		}
+
+		for _, device := range knownDevices {
+			if device == nil {
+				continue
+			}
+			if device.Source.Major == major && device.Source.Minor == minor {
+				devices = append(devices, device.Source.Name)
+				break
+			}
+		}
+	}
+
+	return devices
+}
+
+type DeviceInfo struct {
+	Name            string
+	BlockDeviceName string
+	TableLive       bool
+	TableInactive   bool
+	Suspended       bool
+	ReadOnly        bool
+	DeferredRemove  bool
+	Major           uint32
+	Minor           uint32
+	OpenCount       uint32 // Open reference count
+	TargetCount     uint32 // Number of targets in the live table
+	EventNumber     uint32 // Last event sequence number (used by wait)
+}
+
+// DmsetupInfo returns the information of the device mapper device with the given name
+func DmsetupInfo(dmDeviceName string, executor *commonns.Executor) ([]*DeviceInfo, error) {
+	opts := []string{
+		"info",
+		"--columns",
+		"--noheadings",
+		"-o",
+		"name,blkdevname,attr,major,minor,open,segments,events",
+		"--separator",
+		" ",
+		dmDeviceName,
+	}
+
+	outputStr, err := executor.Execute(nil, dmsetupBinary, opts, types.DmsetupTimeout)
+	if err != nil {
+		return nil, err
+	}
+
+	var (
+		lines   = strings.Split(outputStr, "\n")
+		devices = []*DeviceInfo{}
+	)
+
+	for _, line := range lines {
+		var (
+			attr = ""
+			info = &DeviceInfo{}
+		)
+
+		// Break, if the line is empty or EOF
+		if line == "" {
+			break
+		}
+
+		_, err := fmt.Sscan(line,
+			&info.Name,
+			&info.BlockDeviceName,
+			&attr,
+			&info.Major,
+			&info.Minor,
+			&info.OpenCount,
+			&info.TargetCount,
+			&info.EventNumber)
+		if err != nil {
+			continue
+		}
+
+		// Parse attributes (see "man 8 dmsetup" for details)
+		info.Suspended = strings.Contains(attr, "s")
+		info.ReadOnly = strings.Contains(attr, "r")
+		info.TableLive = strings.Contains(attr, "L")
+		info.TableInactive = strings.Contains(attr, "I")
+
+		// Check deferred-remove flag via non-columns dmsetup info
+		deferredRemove, err := DmsetupInfoDeferredRemove(info.Name, executor)
+		if err == nil {
+			info.DeferredRemove = deferredRemove
+		}
+
+		devices = append(devices, info)
+	}
+
+	return devices, nil
+}
+
+// DmsetupInfoDeferredRemove checks if the device has the deferred-remove flag set
+// by running `dmsetup info <name>` (non-columns format) and parsing the State line.
+func DmsetupInfoDeferredRemove(dmDeviceName string, executor *commonns.Executor) (bool, error) {
+	opts := []string{
+		"info", dmDeviceName,
+	}
+
+	outputStr, err := executor.Execute(nil, dmsetupBinary, opts, types.DmsetupTimeout)
+	if err != nil {
+		return false, err
+	}
+
+	lines := strings.Split(outputStr, "\n")
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "State:") {
+			if strings.Contains(strings.ToUpper(line), "DEFERRED REMOVE") {
+				return true, nil
+			}
+			return false, nil
+		}
+	}
+
+	return false, fmt.Errorf("failed to find State line in dmsetup info output for %s", dmDeviceName)
+}

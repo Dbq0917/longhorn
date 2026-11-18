@@ -1,0 +1,27 @@
+#!/bin/bash
+set -e
+
+cd $(dirname $0)/..
+
+echo Checking crds.yaml is up to date
+bash k8s/generate_code.sh
+if ! git diff --exit-code k8s/crds.yaml; then
+  echo "crds.yaml is not up to date. Please run 'make generate' and commit the changes."
+  exit 1
+fi
+
+echo Running validation
+
+PACKAGES="$(find . -name '*.go' | grep -Ev '.pb.go' | xargs -I{} dirname {} | \
+	sort -u | grep -Ev '(.git|.trash-cache|vendor|bin|k8s/pkg|client)')"
+
+echo Packages: ${PACKAGES}
+
+echo Running: go vet
+go vet ${PACKAGES}
+
+echo Running: golangci-lint
+golangci-lint run --timeout=5m
+
+echo Running: go fmt
+test -z "$(go fmt ${PACKAGES} | tee /dev/stderr)"

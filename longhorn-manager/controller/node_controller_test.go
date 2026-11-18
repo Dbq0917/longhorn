@@ -1,0 +1,2815 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"strings"
+
+	"github.com/sirupsen/logrus"
+
+	. "gopkg.in/check.v1"
+
+	"k8s.io/client-go/kubernetes/scheme"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/client-go/tools/record"
+	"k8s.io/kubernetes/pkg/controller"
+
+	corev1 "k8s.io/api/core/v1"
+	apiextensionsfake "k8s.io/apiextensions-apiserver/pkg/client/clientset/clientset/fake"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	clientset "k8s.io/client-go/kubernetes"
+	fake "k8s.io/client-go/kubernetes/fake"
+
+	"github.com/longhorn/longhorn-manager/datastore"
+	"github.com/longhorn/longhorn-manager/types"
+	"github.com/longhorn/longhorn-manager/util"
+
+	monitor "github.com/longhorn/longhorn-manager/controller/monitor"
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	lhfake "github.com/longhorn/longhorn-manager/k8s/pkg/client/clientset/versioned/fake"
+)
+
+const (
+	eventRecorderBufferSize = 100
+)
+
+var (
+	MountPropagationBidirectional = corev1.MountPropagationBidirectional
+
+	DefaultOrphanTestNode1 = newOrphan(
+		longhorn.OrphanSpec{
+			NodeID: TestNode1,
+			Type:   longhorn.OrphanTypeReplicaData,
+			Parameters: map[string]string{
+				longhorn.OrphanDataName: monitor.TestOrphanedReplicaDirectoryName,
+				longhorn.OrphanDiskName: TestDiskID1,
+				longhorn.OrphanDiskUUID: TestDiskID1,
+				longhorn.OrphanDiskPath: TestDefaultDataPath,
+			},
+		},
+		longhorn.OrphanStatus{
+			OwnerID: TestNode1,
+		},
+	)
+
+	DefaultInstanceManagerTestNode1 = newInstanceManager(
+		TestInstanceManagerName,
+		longhorn.InstanceManagerStateRunning,
+		TestOwnerID1, TestNode1, TestIP1,
+		map[string]longhorn.InstanceProcess{},
+		map[string]longhorn.InstanceProcess{},
+		map[string]longhorn.InstanceProcess{},
+		longhorn.DataEngineTypeV1,
+		TestInstanceManagerImage,
+		false,
+	)
+)
+
+// This data type contains all necessary fixtures for the test, like the mock
+// API clients
+type NodeControllerSuite struct {
+	kubeClient       *fake.Clientset
+	lhClient         *lhfake.Clientset
+	extensionsClient *apiextensionsfake.Clientset
+
+	informerFactories *util.InformerFactories
+
+	lhNodeIndexer            cache.Indexer
+	lhReplicaIndexer         cache.Indexer
+	lhSettingsIndexer        cache.Indexer
+	lhInstanceManagerIndexer cache.Indexer
+	lhOrphanIndexer          cache.Indexer
+
+	podIndexer  cache.Indexer
+	nodeIndexer cache.Indexer
+
+	eventRecorder *record.FakeRecorder
+
+	controller *NodeController
+}
+
+// This data type contains resource that exist in the cluster environment, like
+// nodes and pods
+type NodeControllerFixture struct {
+	lhNodes            map[string]*longhorn.Node
+	lhReplicas         []*longhorn.Replica
+	lhSettings         map[string]*longhorn.Setting
+	lhInstanceManagers map[string]*longhorn.InstanceManager
+	lhOrphans          map[string]*longhorn.Orphan
+	pods               map[string]*corev1.Pod
+	nodes              map[string]*corev1.Node
+}
+
+// This data type contains expected results in the form of resources. Each test
+// will set up fixtures, input resources and expected results. Then it will
+// initialize the mock API with initTest, execute a function of the controller
+// and finally execute a set of assertions, which compare the actual contents of
+// the mock API to the expected results
+type NodeControllerExpectation struct {
+	nodeStatus       map[string]*longhorn.NodeStatus
+	instanceManagers map[string]*longhorn.InstanceManager
+	orphans          map[string]*longhorn.Orphan
+	events           map[string]*corev1.Event
+}
+
+var _ = Suite(&NodeControllerSuite{})
+
+// This is setting up the NodeControllerSuite datastructure as a fixture. It is
+// executed once before each test
+func (s *NodeControllerSuite) SetUpTest(c *C) {
+	s.kubeClient = fake.NewSimpleClientset()                    // nolint: staticcheck
+	s.lhClient = lhfake.NewSimpleClientset()                    // nolint: staticcheck
+	s.extensionsClient = apiextensionsfake.NewSimpleClientset() // nolint: staticcheck
+
+	s.informerFactories = util.NewInformerFactories(TestNamespace, s.kubeClient, s.lhClient, controller.NoResyncPeriodFunc())
+
+	s.lhNodeIndexer = s.informerFactories.LhInformerFactory.Longhorn().V1beta2().Nodes().Informer().GetIndexer()
+	s.lhReplicaIndexer = s.informerFactories.LhInformerFactory.Longhorn().V1beta2().Replicas().Informer().GetIndexer()
+	s.lhSettingsIndexer = s.informerFactories.LhInformerFactory.Longhorn().V1beta2().Settings().Informer().GetIndexer()
+	s.lhInstanceManagerIndexer = s.informerFactories.LhInformerFactory.Longhorn().V1beta2().InstanceManagers().Informer().GetIndexer()
+	s.lhOrphanIndexer = s.informerFactories.LhInformerFactory.Longhorn().V1beta2().Orphans().Informer().GetIndexer()
+
+	s.podIndexer = s.informerFactories.KubeInformerFactory.Core().V1().Pods().Informer().GetIndexer()
+	s.nodeIndexer = s.informerFactories.KubeInformerFactory.Core().V1().Nodes().Informer().GetIndexer()
+
+	s.eventRecorder = record.NewFakeRecorder(eventRecorderBufferSize)
+
+	var err error
+	s.controller, err = newTestNodeController(s.lhClient, s.kubeClient, s.extensionsClient, s.informerFactories, s.eventRecorder, TestNode1)
+	c.Assert(err, IsNil)
+}
+
+func (s *NodeControllerSuite) TestManagerPodUp(c *C) {
+	var err error
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+			},
+			TestNode2: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+				},
+			},
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+	}
+
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestManagerPodDown(c *C) {
+	var err error
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodFailed, TestDaemon1, TestNamespace, TestNode1, TestIP1, nil),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, nil),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonManagerPodDown),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonNoMountPropagationSupport),
+				},
+			},
+			TestNode2: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+				},
+			},
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+	}
+
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestKubeNodeDown(c *C) {
+	var err error
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonKubernetesNodeNotReady),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+			},
+			TestNode2: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+				},
+			},
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+	}
+
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestKubeNodePressure(c *C) {
+	var err error
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusFalse, longhorn.NodeConditionReasonKubernetesNodePressure),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+			},
+			TestNode2: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+				},
+			},
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+	}
+
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestUpdateDiskStatus(c *C) {
+	var err error
+
+	node1 := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node1.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			StorageScheduled:    0,
+			StorageAvailable:    0,
+			Type:                longhorn.DiskTypeFilesystem,
+			FSType:              TestDiskPathFSType,
+			DiskPath:            TestDefaultDataPath,
+			DiskName:            TestDiskID1,
+			InstanceManagerName: TestInstanceManagerName,
+		},
+	}
+	node2 := newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node2.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			StorageScheduled: 0,
+			StorageAvailable: 0,
+			Conditions: []longhorn.Condition{
+				newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusUnknown, ""),
+			},
+			Type:                longhorn.DiskTypeFilesystem,
+			FSType:              TestDiskPathFSType,
+			DiskPath:            TestDefaultDataPath,
+			DiskName:            TestDiskID1,
+			InstanceManagerName: TestInstanceManagerName,
+		},
+	}
+
+	vol := newVolume(TestVolumeName, 2)
+	eng := newEngineForVolume(vol)
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+		lhReplicas: []*longhorn.Replica{
+			newReplicaForVolume(vol, eng, TestNode1, TestDiskID1),
+			newReplicaForVolume(vol, eng, TestNode2, TestDiskID2),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						StorageScheduled: TestVolumeSize,
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.DiskConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+							newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusFalse, string(longhorn.DiskConditionReasonDiskPressure)),
+						},
+						ScheduledReplica: map[string]int64{
+							fixture.lhReplicas[0].Name: fixture.lhReplicas[0].Spec.VolumeSize,
+						},
+						ScheduledBackingImage: map[string]int64{},
+						DiskName:              TestDiskID1,
+						DiskUUID:              TestDiskID1,
+						Type:                  longhorn.DiskTypeFilesystem,
+						FSType:                TestDiskPathFSType,
+						DiskPath:              TestDefaultDataPath,
+						InstanceManagerName:   TestInstanceManagerName,
+					},
+				},
+			},
+			TestNode2: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						StorageScheduled: 0,
+						StorageAvailable: 0,
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusUnknown, ""),
+						},
+						Type:                longhorn.DiskTypeFilesystem,
+						FSType:              TestDiskPathFSType,
+						DiskPath:            TestDefaultDataPath,
+						DiskName:            TestDiskID1,
+						InstanceManagerName: TestInstanceManagerName,
+					},
+				},
+			},
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+		s.checkDiskConditions(c, expectation, n)
+	}
+
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestCleanDiskStatus(c *C) {
+	var err error
+
+	node1 := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node1.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			StorageScheduled: 0,
+			StorageAvailable: 0,
+			Conditions: []longhorn.Condition{
+				newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+			},
+			DiskName: TestDiskID1,
+		},
+		"unavailable-disk": {
+			StorageScheduled: 0,
+			StorageAvailable: 0,
+			Conditions: []longhorn.Condition{
+				newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+			},
+		},
+	}
+	node2 := newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node2.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			StorageScheduled:    0,
+			StorageAvailable:    0,
+			Type:                longhorn.DiskTypeFilesystem,
+			FSType:              TestDiskPathFSType,
+			DiskPath:            TestDefaultDataPath,
+			DiskName:            TestDiskID1,
+			InstanceManagerName: TestInstanceManagerName,
+		},
+	}
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						StorageScheduled: 0,
+						StorageAvailable: 0,
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusFalse, string(longhorn.DiskConditionReasonDiskPressure)),
+							newNodeCondition(longhorn.DiskConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+						},
+						ScheduledReplica:      map[string]int64{},
+						ScheduledBackingImage: map[string]int64{},
+						DiskName:              TestDiskID1,
+						DiskUUID:              TestDiskID1,
+						Type:                  longhorn.DiskTypeFilesystem,
+						FSType:                TestDiskPathFSType,
+						DiskPath:              TestDefaultDataPath,
+						InstanceManagerName:   TestInstanceManagerName,
+					},
+				},
+			},
+			TestNode2: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						StorageScheduled:    0,
+						StorageAvailable:    0,
+						Type:                longhorn.DiskTypeFilesystem,
+						FSType:              TestDiskPathFSType,
+						DiskPath:            TestDefaultDataPath,
+						DiskName:            TestDiskID1,
+						InstanceManagerName: TestInstanceManagerName,
+					},
+				},
+			},
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+		s.checkDiskConditions(c, expectation, n)
+	}
+
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestDisableDiskOnFilesystemChange(c *C) {
+	var err error
+
+	node1 := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node1.Spec.Disks = map[string]longhorn.DiskSpec{
+		TestDiskID1: {
+			Type:            longhorn.DiskTypeFilesystem,
+			Path:            TestDefaultDataPath,
+			DiskDriver:      longhorn.DiskDriverNone,
+			AllowScheduling: true,
+			StorageReserved: 0,
+		},
+	}
+	node1.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			StorageScheduled: 0,
+			StorageAvailable: 0,
+			StorageMaximum:   TestDiskSize,
+			Conditions: []longhorn.Condition{
+				newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+				newNodeCondition(longhorn.DiskConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+			},
+			DiskName:            TestDiskID1,
+			DiskUUID:            "new-uuid",
+			Type:                longhorn.DiskTypeFilesystem,
+			FSType:              TestDiskPathFSType,
+			DiskPath:            TestDefaultDataPath,
+			InstanceManagerName: TestInstanceManagerName,
+		},
+	}
+
+	node2 := newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node2.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			DiskName:            TestDiskID1,
+			StorageScheduled:    0,
+			StorageAvailable:    0,
+			Type:                longhorn.DiskTypeFilesystem,
+			FSType:              TestDiskPathFSType,
+			DiskPath:            TestDefaultDataPath,
+			InstanceManagerName: TestInstanceManagerName,
+		},
+	}
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						StorageScheduled: 0,
+						StorageAvailable: 0,
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusFalse, string(longhorn.DiskConditionReasonDiskNotReady)),
+							newNodeCondition(longhorn.DiskConditionTypeReady, longhorn.ConditionStatusFalse, string(longhorn.DiskConditionReasonDiskFilesystemChanged)),
+						},
+						ScheduledReplica:      map[string]int64{},
+						ScheduledBackingImage: map[string]int64{},
+						DiskName:              TestDiskID1,
+						DiskUUID:              "new-uuid",
+						Type:                  longhorn.DiskTypeFilesystem,
+						FSType:                TestDiskPathFSType,
+						DiskPath:              TestDefaultDataPath,
+						InstanceManagerName:   TestInstanceManagerName,
+					},
+				},
+			},
+			TestNode2: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						DiskName:            TestDiskID1,
+						StorageScheduled:    0,
+						StorageAvailable:    0,
+						Type:                longhorn.DiskTypeFilesystem,
+						FSType:              TestDiskPathFSType,
+						DiskPath:            TestDefaultDataPath,
+						InstanceManagerName: TestInstanceManagerName,
+					},
+				},
+			},
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+		s.checkDiskConditions(c, expectation, n)
+	}
+
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestCreateDefaultInstanceManager(c *C) {
+	var err error
+
+	node1 := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node1.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			StorageScheduled: 0,
+			StorageAvailable: 0,
+			Conditions: []longhorn.Condition{
+				newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+			},
+			Type:     longhorn.DiskTypeFilesystem,
+			DiskName: TestDiskID1,
+		},
+	}
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: node1,
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						StorageScheduled: 0,
+						StorageAvailable: 0,
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusFalse, string(longhorn.DiskConditionReasonDiskPressure)),
+							newNodeCondition(longhorn.DiskConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+						},
+						DiskName:              TestDiskID1,
+						ScheduledReplica:      map[string]int64{},
+						ScheduledBackingImage: map[string]int64{},
+						DiskUUID:              TestDiskID1,
+						Type:                  longhorn.DiskTypeFilesystem,
+						FSType:                TestDiskPathFSType,
+						DiskPath:              TestDefaultDataPath,
+						InstanceManagerName:   TestInstanceManagerName,
+					},
+				},
+			},
+		},
+		instanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: newInstanceManager(
+				TestInstanceManagerName, longhorn.InstanceManagerStateRunning,
+				TestOwnerID1, TestNode1, TestIP1,
+				map[string]longhorn.InstanceProcess{},
+				map[string]longhorn.InstanceProcess{},
+				map[string]longhorn.InstanceProcess{},
+				longhorn.DataEngineTypeV1,
+				TestInstanceManagerImage,
+				false,
+			),
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+		s.checkDiskConditions(c, expectation, n)
+	}
+
+	s.checkInstanceManagers(c, expectation)
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestCleanupRedundantInstanceManagers(c *C) {
+	var err error
+
+	node1 := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node1.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		TestDiskID1: {
+			StorageScheduled: 0,
+			StorageAvailable: 0,
+			Conditions: []longhorn.Condition{
+				newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+			},
+			Type:     longhorn.DiskTypeFilesystem,
+			DiskName: TestDiskID1,
+		},
+	}
+
+	extraInstanceManager := newInstanceManager(
+		"extra-instance-manager-name", longhorn.InstanceManagerStateRunning,
+		TestOwnerID1, TestNode1, TestIP1,
+		map[string]longhorn.InstanceProcess{
+			ExistingInstance: {
+				Spec: longhorn.InstanceProcessSpec{
+					Name: ExistingInstance,
+				},
+				Status: longhorn.InstanceProcessStatus{
+					State:     longhorn.InstanceStateRunning,
+					PortStart: TestPort1,
+				},
+			},
+		},
+		map[string]longhorn.InstanceProcess{},
+		map[string]longhorn.InstanceProcess{},
+		longhorn.DataEngineTypeV1,
+		TestExtraInstanceManagerImage,
+		false,
+	)
+	extraInstanceManager.Spec.Image = TestExtraInstanceManagerImage
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: node1,
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName:       DefaultInstanceManagerTestNode1,
+			"extra-instance-manager-name": extraInstanceManager,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{
+					TestDiskID1: {
+						StorageScheduled: 0,
+						StorageAvailable: 0,
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.DiskConditionTypeSchedulable, longhorn.ConditionStatusFalse, string(longhorn.DiskConditionReasonDiskPressure)),
+							newNodeCondition(longhorn.DiskConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+						},
+						DiskName:              TestDiskID1,
+						ScheduledReplica:      map[string]int64{},
+						ScheduledBackingImage: map[string]int64{},
+						DiskUUID:              TestDiskID1,
+						Type:                  longhorn.DiskTypeFilesystem,
+						FSType:                TestDiskPathFSType,
+						DiskPath:              TestDefaultDataPath,
+						InstanceManagerName:   TestInstanceManagerName,
+					},
+				},
+			},
+		},
+		instanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: newInstanceManager(
+				TestInstanceManagerName, longhorn.InstanceManagerStateRunning,
+				TestOwnerID1, TestNode1, TestIP1,
+				map[string]longhorn.InstanceProcess{},
+				map[string]longhorn.InstanceProcess{},
+				map[string]longhorn.InstanceProcess{},
+				longhorn.DataEngineTypeV1,
+				TestInstanceManagerImage,
+				false,
+			),
+			"extra-instance-manager-name": extraInstanceManager,
+		},
+		orphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+		s.checkDiskConditions(c, expectation, n)
+	}
+
+	s.checkInstanceManagers(c, expectation)
+	s.checkOrphans(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestCleanupAllInstanceManagers(c *C) {
+	var err error
+
+	node1 := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, "")
+	node1.Spec.Disks = map[string]longhorn.DiskSpec{}
+	node1.Status.DiskStatus = map[string]*longhorn.DiskStatus{}
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: node1,
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		nodeStatus: map[string]*longhorn.NodeStatus{
+			TestNode1: {
+				Conditions: []longhorn.Condition{
+					newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+					newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+				},
+				DiskStatus: map[string]*longhorn.DiskStatus{},
+			},
+		},
+		instanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: newInstanceManager(
+				TestInstanceManagerName, longhorn.InstanceManagerStateRunning,
+				TestOwnerID1, TestNode1, TestIP1,
+				map[string]longhorn.InstanceProcess{},
+				map[string]longhorn.InstanceProcess{},
+				map[string]longhorn.InstanceProcess{},
+				longhorn.DataEngineTypeV1,
+				TestInstanceManagerImage,
+				false,
+			),
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+
+		s.checkNodeConditions(c, expectation, n)
+	}
+
+	s.checkInstanceManagers(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestEventOnNotReady(c *C) {
+	var err error
+
+	node1 := newKubernetesNode(
+		TestNode1,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+
+	node2 := newKubernetesNode(
+		TestNode2,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		events: map[string]*corev1.Event{
+			"node2-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Node test-node-name-2 is ready",
+			},
+			"node-schedulable": {
+				Type:    "Normal",
+				Reason:  "Schedulable",
+				Message: "",
+			},
+			"disk-wait-ready": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be ready",
+			},
+			"disk-wait-schedulable": {
+				Type:    "Warning",
+				Reason:  "Schedulable",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be schedulable",
+			},
+			"disk-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Disk fsid(/var/lib/longhorn) on node test-node-name-1 is ready",
+			},
+			"node1-not-ready": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Kubernetes node test-node-name-1 not ready",
+			},
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+	}
+
+	s.checkEvents(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestEventOnDiskPressure(c *C) {
+	var err error
+
+	node1 := newKubernetesNode(
+		TestNode1,
+		corev1.ConditionTrue,
+		corev1.ConditionTrue,  // disk
+		corev1.ConditionFalse, // memory
+		corev1.ConditionFalse, // pid
+		corev1.ConditionFalse, // network
+		corev1.ConditionTrue,
+	)
+
+	node2 := newKubernetesNode(
+		TestNode2,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		events: map[string]*corev1.Event{
+			"node2-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Node test-node-name-2 is ready",
+			},
+			"node-schedulable": {
+				Type:    "Normal",
+				Reason:  "Schedulable",
+				Message: "",
+			},
+			"disk-wait-ready": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be ready",
+			},
+			"disk-wait-schedulable": {
+				Type:    "Warning",
+				Reason:  "Schedulable",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be schedulable",
+			},
+			"disk-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Disk fsid(/var/lib/longhorn) on node test-node-name-1 is ready",
+			},
+			"node1-disk-pressure": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Kubernetes node test-node-name-1 has pressure",
+			},
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+	}
+
+	s.checkEvents(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestEventOnMemoryPressure(c *C) {
+	var err error
+
+	node1 := newKubernetesNode(
+		TestNode1,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse, // disk
+		corev1.ConditionTrue,  // memory
+		corev1.ConditionFalse, // pid
+		corev1.ConditionFalse, // network
+		corev1.ConditionTrue,
+	)
+
+	node2 := newKubernetesNode(
+		TestNode2,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		events: map[string]*corev1.Event{
+			"node2-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Node test-node-name-2 is ready",
+			},
+			"node-schedulable": {
+				Type:    "Normal",
+				Reason:  "Schedulable",
+				Message: "",
+			},
+			"disk-wait-ready": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be ready",
+			},
+			"disk-wait-schedulable": {
+				Type:    "Warning",
+				Reason:  "Schedulable",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be schedulable",
+			},
+			"disk-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Disk fsid(/var/lib/longhorn) on node test-node-name-1 is ready",
+			},
+			"node1-memory-pressure": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Kubernetes node test-node-name-1 has pressure",
+			},
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+	}
+
+	s.checkEvents(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestEventOnPidPressure(c *C) {
+	var err error
+
+	node1 := newKubernetesNode(
+		TestNode1,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse, // disk
+		corev1.ConditionFalse, // memory
+		corev1.ConditionTrue,  // pid
+		corev1.ConditionFalse, // network
+		corev1.ConditionTrue,
+	)
+
+	node2 := newKubernetesNode(
+		TestNode2,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		events: map[string]*corev1.Event{
+			"node2-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Node test-node-name-2 is ready",
+			},
+			"node-schedulable": {
+				Type:    "Normal",
+				Reason:  "Schedulable",
+				Message: "",
+			},
+			"disk-wait-ready": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be ready",
+			},
+			"disk-wait-schedulable": {
+				Type:    "Warning",
+				Reason:  "Schedulable",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be schedulable",
+			},
+			"disk-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Disk fsid(/var/lib/longhorn) on node test-node-name-1 is ready",
+			},
+			"node1-pid-pressure": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Kubernetes node test-node-name-1 has pressure",
+			},
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+	}
+
+	s.checkEvents(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestEventOnNetworkPressure(c *C) {
+	var err error
+
+	node1 := newKubernetesNode(
+		TestNode1,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse, // disk
+		corev1.ConditionFalse, // memory
+		corev1.ConditionFalse, // pid
+		corev1.ConditionTrue,  // network
+		corev1.ConditionTrue,
+	)
+
+	node2 := newKubernetesNode(
+		TestNode2,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		events: map[string]*corev1.Event{
+			"node2-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Node test-node-name-2 is ready",
+			},
+			"node-schedulable": {
+				Type:    "Normal",
+				Reason:  "Schedulable",
+				Message: "",
+			},
+			"disk-wait-ready": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be ready",
+			},
+			"disk-wait-schedulable": {
+				Type:    "Warning",
+				Reason:  "Schedulable",
+				Message: "Waiting for disk fsid (/var/lib/longhorn) on node test-node-name-1 to be schedulable",
+			},
+			"disk-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Disk fsid(/var/lib/longhorn) on node test-node-name-1 is ready",
+			},
+			"node1-network-pressure": {
+				Type:    "Warning",
+				Reason:  "Ready",
+				Message: "Kubernetes node test-node-name-1 has pressure",
+			},
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+	}
+
+	s.checkEvents(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestNoEventOnUnknownTrueNodeCondition(c *C) {
+	var err error
+
+	node1 := newKubernetesNode(
+		TestNode1,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+	node1.Status.Conditions = append(node1.Status.Conditions, corev1.NodeCondition{
+		Type:    "EtcdIsVoter",
+		Status:  corev1.ConditionTrue,
+		Reason:  "MemberNotLearner",
+		Message: "Node is a voting member of the etcd cluster",
+	})
+
+	node2 := newKubernetesNode(
+		TestNode2,
+		corev1.ConditionTrue,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionFalse,
+		corev1.ConditionTrue,
+	)
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: node1,
+			TestNode2: node2,
+		},
+	}
+
+	expectation := &NodeControllerExpectation{
+		events: map[string]*corev1.Event{
+			"node1-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Node test-node-name-1 is ready",
+			},
+			"node2-ready": {
+				Type:    "Normal",
+				Reason:  "Ready",
+				Message: "Node test-node-name-2 is ready",
+			},
+			"node-schedulable": {
+				Type:    "Normal",
+				Reason:  "Schedulable",
+				Message: "",
+			},
+			"": {
+				Type:    "Warning",
+				Reason:  "Schedulable",
+				Message: "Disk fsid (/var/lib/longhorn) on the node test-node-name-1 is not schedulable for more replica",
+			},
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	for _, node := range fixture.lhNodes {
+		if s.controller.controllerID == node.Name {
+			err = s.controller.diskMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.environmentCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+			err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncNode(getKey(node, c))
+		c.Assert(err, IsNil)
+	}
+
+	s.checkEvents(c, expectation)
+}
+
+func (s *NodeControllerSuite) TestSyncInstanceManagers(c *C) {
+	// Skip the Lister check that occurs on creation of an Instance Manager.
+	datastore.SkipListerCheck = true
+
+	var err error
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	defaultInstanceManager := DefaultInstanceManagerTestNode1.DeepCopy()
+	defaultInstanceManagerName, err := types.GetInstanceManagerName(
+		defaultInstanceManager.Spec.Type,
+		defaultInstanceManager.Spec.NodeID,
+		defaultInstanceManager.Spec.Image,
+		string(defaultInstanceManager.Spec.DataEngine))
+	c.Assert(err, IsNil)
+
+	defaultInstanceManager.Name = defaultInstanceManagerName
+
+	type instanceManagerCases struct {
+		existingInstanceManagers map[string]*longhorn.InstanceManager
+		isLabeled                bool
+		isExpectError            bool
+	}
+	testCases := map[string]instanceManagerCases{
+		"instance manager should be deleted and requeue node when instance manager labels are missing": {
+			existingInstanceManagers: map[string]*longhorn.InstanceManager{
+				defaultInstanceManagerName: defaultInstanceManager,
+			},
+			isLabeled:     false,
+			isExpectError: false,
+		},
+	}
+
+	for testName, testCase := range testCases {
+		fmt.Printf("testing %v", testName)
+
+		node := fixture.lhNodes[TestNode1]
+
+		if !testCase.isLabeled {
+			existingInstanceManagers := testCase.existingInstanceManagers
+			for name := range existingInstanceManagers {
+				existingInstanceManagers[name].Labels = nil
+			}
+			fixture.lhInstanceManagers = existingInstanceManagers
+		}
+
+		for _, instanceManager := range testCase.existingInstanceManagers {
+			im, err := s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).Get(context.TODO(), instanceManager.Name, metav1.GetOptions{})
+			if err != nil && !apierrors.IsNotFound(err) {
+				c.Assert(err, IsNil)
+			}
+			if im != nil && err == nil {
+				err := s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).Delete(context.TODO(), instanceManager.Name, metav1.DeleteOptions{})
+				c.Assert(err, IsNil)
+			}
+
+			im, err = s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).Create(context.TODO(), instanceManager, metav1.CreateOptions{})
+			c.Assert(err, IsNil)
+			c.Assert(im, NotNil)
+
+			err = s.lhInstanceManagerIndexer.Add(im)
+			c.Assert(err, IsNil)
+		}
+
+		err = s.controller.syncInstanceManagers(node)
+		if len(testCase.existingInstanceManagers) > 0 {
+			instanceManagers, err := s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).List(context.TODO(), metav1.ListOptions{})
+			c.Assert(err, IsNil)
+			c.Assert(len(instanceManagers.Items), Equals, 0)
+		} else {
+			c.Assert(err, IsNil)
+		}
+
+		// Simulate the enqueue.
+		err = s.controller.syncInstanceManagers(node)
+		if testCase.isExpectError {
+			c.Assert(err, NotNil)
+			continue
+		}
+		c.Assert(err, IsNil)
+
+		instanceManagers, err := s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).List(context.TODO(), metav1.ListOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(len(instanceManagers.Items), Equals, len(testCase.existingInstanceManagers))
+	}
+}
+
+func (s *NodeControllerSuite) TestKubeNodeNFSCapabilityCondition(c *C) {
+	var err error
+
+	// Create a mock kernel config file
+	err = os.MkdirAll(TestKernelConfigDIR, 0755)
+	c.Assert(err, IsNil)
+	defer func() {
+		if closeErr := os.RemoveAll(TestKernelConfigFilePath); closeErr != nil {
+			c.Logf("Warning: failed to remove %s: %v", TestKernelConfigFilePath, closeErr)
+		}
+	}()
+
+	// The content of the mock kernel config
+	mockKernelConfigContent := `CONFIG_DM_CRYPT=y
+CONFIG_NFS_V4=m
+CONFIG_NFS_V4_1=m
+CONFIG_NFS_V4_2=y`
+
+	genKernelConfig := func(content string) {
+		err = os.WriteFile(TestKernelConfigFilePath, []byte(content), 0644)
+		c.Assert(err, IsNil)
+	}
+
+	// Create a mock NFS mount config file
+	err = os.MkdirAll(TestSystemEtcDIR, 0755)
+	c.Assert(err, IsNil)
+	defer func() {
+		if closeErr := os.RemoveAll(TestSystemEtcDIR); closeErr != nil {
+			c.Logf("Warning: failed to remove %s: %v", TestSystemEtcDIR, closeErr)
+		}
+	}()
+
+	// The content of the mock NFS mount config
+	genNFSMountConf := func(nfsVer string) {
+		data := fmt.Sprintf("[ NFSMount_Global_Options ]\nDefaultvers=%s\n", nfsVer)
+		err := os.WriteFile(TestNFSMountConfigPath, []byte(data), 0644)
+		c.Assert(err, IsNil)
+	}
+
+	fixture := &NodeControllerFixture{
+		lhNodes: map[string]*longhorn.Node{
+			TestNode1: newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+			TestNode2: newNode(TestNode2, TestNamespace, true, longhorn.ConditionStatusUnknown, ""),
+		},
+		lhSettings: map[string]*longhorn.Setting{
+			string(types.SettingNameDefaultInstanceManagerImage): newDefaultInstanceManagerImageSetting(),
+		},
+		lhInstanceManagers: map[string]*longhorn.InstanceManager{
+			TestInstanceManagerName: DefaultInstanceManagerTestNode1,
+		},
+		lhOrphans: map[string]*longhorn.Orphan{
+			DefaultOrphanTestNode1.Name: DefaultOrphanTestNode1,
+		},
+		pods: map[string]*corev1.Pod{
+			TestDaemon1: newDaemonPod(corev1.PodRunning, TestDaemon1, TestNamespace, TestNode1, TestIP1, &MountPropagationBidirectional),
+			TestDaemon2: newDaemonPod(corev1.PodRunning, TestDaemon2, TestNamespace, TestNode2, TestIP2, &MountPropagationBidirectional),
+		},
+		nodes: map[string]*corev1.Node{
+			TestNode1: newKubernetesNode(
+				TestNode1,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+			TestNode2: newKubernetesNode(
+				TestNode2,
+				corev1.ConditionTrue,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionFalse,
+				corev1.ConditionTrue,
+			),
+		},
+	}
+
+	s.initTest(c, fixture)
+
+	type nfsConfigCases struct {
+		setup                 func()
+		expectConditionStatus longhorn.ConditionStatus
+		expectConditionReason string
+	}
+	testCases := map[string]nfsConfigCases{
+		"it is acceptable when nfsmount.conf is not present": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				_, err := os.Stat(TestNFSMountConfigPath)
+				c.Assert(os.IsNotExist(err), Equals, true)
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4")
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4.0": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.0")
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4.1": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.1")
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is acceptable when default NFS version set to 4.2": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.2")
+			},
+			longhorn.ConditionStatusTrue,
+			"",
+		},
+		"it is not acceptable when no kernel module enabled for NFS": {
+			func() {
+				genKernelConfig("CONFIG_DM_CRYPT=y")
+				genNFSMountConf("4.3")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsNotFound,
+		},
+		"it is not acceptable when default NFS version newer than 4.2": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("4.3")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
+		},
+		"it is not acceptable when default NFS version older then 4": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("3")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
+		},
+		"it is not acceptable when default NFS version illegal value": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("???")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
+		},
+		"it is not acceptable when default NFS version empty value": {
+			func() {
+				genKernelConfig(mockKernelConfigContent)
+				genNFSMountConf("")
+			},
+			longhorn.ConditionStatusFalse,
+			longhorn.NodeConditionReasonNFSClientIsMisconfigured,
+		},
+	}
+
+	for testName, testCase := range testCases {
+		fmt.Printf("testing %v", testName)
+		func(setup func(), expectConditionStatus longhorn.ConditionStatus, expectConditionReason string) {
+			setup()
+			defer func() {
+				if closeErr := os.Remove(TestNFSMountConfigPath); closeErr != nil {
+					c.Logf("Warning: failed to remove %s: %v", TestNFSMountConfigPath, closeErr)
+				}
+			}()
+
+			expectation := &NodeControllerExpectation{
+				nodeStatus: map[string]*longhorn.NodeStatus{
+					TestNode1: {
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+							newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+							newNodeCondition(longhorn.NodeConditionTypeMountPropagation, longhorn.ConditionStatusTrue, ""),
+						},
+					},
+					TestNode2: {
+						Conditions: []longhorn.Condition{
+							newNodeCondition(longhorn.NodeConditionTypeSchedulable, longhorn.ConditionStatusTrue, ""),
+							newNodeCondition(longhorn.NodeConditionTypeReady, longhorn.ConditionStatusTrue, ""),
+						},
+					},
+				},
+			}
+
+			for _, node := range fixture.lhNodes {
+				if s.controller.controllerID == node.Name {
+					err = s.controller.diskMonitor.RunOnce()
+					c.Assert(err, IsNil)
+					err = s.controller.environmentCheckMonitor.RunOnce()
+					c.Assert(err, IsNil)
+					err = s.controller.cpuPolicyCheckMonitor.RunOnce()
+					c.Assert(err, IsNil)
+				}
+
+				err = s.controller.syncNode(getKey(node, c))
+				c.Assert(err, IsNil)
+
+				n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Get(context.TODO(), node.Name, metav1.GetOptions{})
+				c.Assert(err, IsNil)
+
+				s.checkNodeConditions(c, expectation, n)
+			}
+		}(testCase.setup, testCase.expectConditionStatus, testCase.expectConditionReason)
+	}
+}
+
+func (s *NodeControllerSuite) TestShouldConsiderOnDemandRequest(c *C) {
+	testCases := []struct {
+		name            string
+		requestedAt     string
+		lastCompletedAt string
+		expected        bool
+		expectErr       bool
+		errPattern      string
+	}{
+		{
+			name:            "no request",
+			requestedAt:     "",
+			lastCompletedAt: "2026-03-09T09:00:00Z",
+			expected:        false,
+		},
+		{
+			name:            "first request",
+			requestedAt:     "2026-03-09T10:00:00Z",
+			lastCompletedAt: "",
+			expected:        true,
+		},
+		{
+			name:            "new request",
+			requestedAt:     "2026-03-09T10:00:00Z",
+			lastCompletedAt: "2026-03-09T09:00:00Z",
+			expected:        true,
+		},
+		{
+			name:            "old request",
+			requestedAt:     "2026-03-09T08:00:00Z",
+			lastCompletedAt: "2026-03-09T09:00:00Z",
+			expected:        false,
+		},
+		{
+			name:            "equal request time",
+			requestedAt:     "2026-03-09T09:00:00Z",
+			lastCompletedAt: "2026-03-09T09:00:00Z",
+			expected:        false,
+		},
+		{
+			name:            "invalid requestedAt",
+			requestedAt:     "invalid-time",
+			lastCompletedAt: "2026-03-09T09:00:00Z",
+			expectErr:       true,
+			errPattern:      "failed to parse SnapshotHashingRequestedAt.*",
+		},
+		{
+			name:            "invalid lastCompletedAt",
+			requestedAt:     "2026-03-09T10:00:00Z",
+			lastCompletedAt: "invalid-time",
+			expectErr:       true,
+			errPattern:      "failed to parse LastOnDemandSnapshotHashingCompleteAt.*",
+		},
+	}
+
+	for _, tc := range testCases {
+		c.Logf("testing case %q", tc.name)
+
+		v := &longhorn.Volume{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "vol1",
+			},
+			Spec: longhorn.VolumeSpec{
+				SnapshotHashingRequestedAt: tc.requestedAt,
+			},
+			Status: longhorn.VolumeStatus{
+				LastOnDemandSnapshotHashingCompleteAt: tc.lastCompletedAt,
+			},
+		}
+
+		ok, err := shouldConsiderOnDemandRequest(v)
+		if tc.expectErr {
+			c.Assert(err, NotNil)
+			c.Assert(ok, Equals, false)
+			c.Assert(err.Error(), Matches, tc.errPattern)
+			continue
+		}
+
+		c.Assert(err, IsNil)
+		c.Assert(ok, Equals, tc.expected)
+	}
+}
+
+// -- Helpers --
+
+func (s *NodeControllerSuite) checkNodeConditions(c *C, expectation *NodeControllerExpectation, node *longhorn.Node) {
+	// Check that all node status conditions match the expected node status
+	// conditions - save for the last transition timestamp and the actual
+	// message
+	for idx, condition := range node.Status.Conditions {
+		condition.LastTransitionTime = ""
+		condition.Message = ""
+		node.Status.Conditions[idx] = condition
+	}
+	c.Assert(node.Status.Conditions, DeepEquals, expectation.nodeStatus[node.Name].Conditions)
+}
+
+func (s *NodeControllerSuite) checkDiskConditions(c *C, expectation *NodeControllerExpectation, node *longhorn.Node) {
+	// Check that all disk status conditions match the expected disk status
+	// conditions - save for the last transition timestamp and the actual message
+	for fsid, diskStatus := range node.Status.DiskStatus {
+		for idx, condition := range diskStatus.Conditions {
+			if condition.Status != longhorn.ConditionStatusUnknown {
+				c.Assert(condition.LastTransitionTime, Not(Equals), "")
+			}
+			condition.LastTransitionTime = ""
+			condition.Message = ""
+			diskStatus.Conditions[idx] = condition
+		}
+		node.Status.DiskStatus[fsid] = diskStatus
+	}
+	c.Assert(node.Status.DiskStatus, DeepEquals, expectation.nodeStatus[node.Name].DiskStatus)
+}
+
+func (s *NodeControllerSuite) checkInstanceManagers(c *C, expectation *NodeControllerExpectation) {
+	// Check that all existing instance managers are expected and all expected
+	// instance managers are existing
+	imList, err := s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).List(context.TODO(), metav1.ListOptions{})
+	c.Assert(err, IsNil)
+
+	for _, im := range imList.Items {
+		_, exists := expectation.instanceManagers[im.Name]
+		c.Assert(exists, Equals, true)
+	}
+
+	for _, im := range expectation.instanceManagers {
+		_, err := s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).Get(context.TODO(), im.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+	}
+}
+
+func (s *NodeControllerSuite) checkOrphans(c *C, expectation *NodeControllerExpectation) {
+	// Check that all existing orphans are expected and all expected orphans are
+	// existing
+	orphanList, err := s.lhClient.LonghornV1beta2().Orphans(TestNamespace).List(context.TODO(), metav1.ListOptions{})
+	c.Assert(err, IsNil)
+
+	for _, orphan := range orphanList.Items {
+		_, exists := expectation.orphans[orphan.Name]
+		c.Assert(exists, Equals, true)
+	}
+
+	for _, expect := range expectation.orphans {
+		_, err := s.lhClient.LonghornV1beta2().Orphans(TestNamespace).Get(context.TODO(), expect.Name, metav1.GetOptions{})
+		c.Assert(err, IsNil)
+	}
+}
+
+func (s *NodeControllerSuite) checkEvents(c *C, expectation *NodeControllerExpectation) {
+	recordedEvents := []string{}
+
+	// extract recorded events from buffered channel into array for easier
+	// handling
+out:
+	for i := 0; i < eventRecorderBufferSize; i++ {
+		select {
+		case event, ok := <-(s.eventRecorder).Events:
+			if ok {
+				recordedEvents = append(recordedEvents, event)
+				c.Logf("recorded event: %v", event)
+			} else {
+				break out
+			}
+		default:
+			break out
+		}
+	}
+
+	// check that there have not been any unexpected events
+	for _, event := range recordedEvents {
+		match := false
+		for _, expect := range expectation.events {
+			if strings.Contains(event, expect.Type) && strings.Contains(event, expect.Reason) && strings.Contains(event, expect.Message) {
+				match = true
+				break
+			}
+		}
+		c.Assert(match, Equals, true, Commentf("unexpected event \"%v\"", event))
+	}
+
+	// check that all expected events have been emitted
+	for _, expect := range expectation.events {
+		match := false
+		for _, event := range recordedEvents {
+			if strings.Contains(event, expect.Type) && strings.Contains(event, expect.Reason) && strings.Contains(event, expect.Message) {
+				match = true
+				break
+			}
+		}
+		c.Assert(match, Equals, true, Commentf("failed to find expected event \"%v %v %v\"", expect.Type, expect.Reason, expect.Message))
+	}
+}
+
+func (s *NodeControllerSuite) initTest(c *C, fixture *NodeControllerFixture) {
+	c.Assert(s.kubeClient, NotNil)
+	c.Assert(s.lhClient, NotNil)
+	c.Assert(s.extensionsClient, NotNil)
+
+	for _, node := range fixture.lhNodes {
+		n, err := s.lhClient.LonghornV1beta2().Nodes(TestNamespace).Create(context.TODO(), node, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(n, NotNil)
+		err = s.lhNodeIndexer.Add(n)
+		c.Assert(err, IsNil)
+	}
+
+	for _, replica := range fixture.lhReplicas {
+		r, err := s.lhClient.LonghornV1beta2().Replicas(TestNamespace).Create(context.TODO(), replica, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(r, NotNil)
+		err = s.lhReplicaIndexer.Add(r)
+		c.Assert(err, IsNil)
+	}
+
+	for _, setting := range fixture.lhSettings {
+		set, err := s.lhClient.LonghornV1beta2().Settings(TestNamespace).Create(context.TODO(), setting, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(set, NotNil)
+		err = s.lhSettingsIndexer.Add(set)
+		c.Assert(err, IsNil)
+	}
+
+	for _, instanceManager := range fixture.lhInstanceManagers {
+		im, err := s.lhClient.LonghornV1beta2().InstanceManagers(TestNamespace).Create(context.TODO(), instanceManager, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(im, NotNil)
+		err = s.lhInstanceManagerIndexer.Add(im)
+		c.Assert(err, IsNil)
+	}
+
+	for _, orphan := range fixture.lhOrphans {
+		o, err := s.lhClient.LonghornV1beta2().Orphans(TestNamespace).Create(context.TODO(), orphan, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(o, NotNil)
+		err = s.lhOrphanIndexer.Add(o)
+		c.Assert(err, IsNil)
+	}
+
+	for _, node := range fixture.nodes {
+		n, err := s.kubeClient.CoreV1().Nodes().Create(context.TODO(), node, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(n, NotNil)
+		err = s.nodeIndexer.Add(n)
+		c.Assert(err, IsNil)
+	}
+
+	for _, pod := range fixture.pods {
+		p, err := s.kubeClient.CoreV1().Pods(TestNamespace).Create(context.TODO(), pod, metav1.CreateOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(p, NotNil)
+		err = s.podIndexer.Add(p)
+		c.Assert(err, IsNil)
+	}
+}
+
+func newTestNodeController(lhClient *lhfake.Clientset, kubeClient *fake.Clientset, extensionsClient *apiextensionsfake.Clientset,
+	informerFactories *util.InformerFactories, eventRecorder *record.FakeRecorder, controllerID string) (*NodeController, error) {
+	ds := datastore.NewDataStore(TestNamespace, lhClient, kubeClient, extensionsClient, informerFactories)
+
+	logger := logrus.StandardLogger()
+	nc, err := NewNodeController(logger, ds, scheme.Scheme, kubeClient, TestNamespace, controllerID, TestInstanceManagerImage)
+	if err != nil {
+		return nil, err
+	}
+	nc.eventRecorder = eventRecorder
+	nc.topologyLabelsChecker = fakeTopologyLabelsChecker
+
+	enqueueNodeForMonitor := func(key string) {
+		nc.queue.Add(key)
+	}
+	diskMonitor, err := monitor.NewFakeDiskMonitor(nc.logger, nc.ds, controllerID, enqueueNodeForMonitor)
+	if err != nil {
+		return nil, err
+	}
+	nc.diskMonitor = diskMonitor
+
+	environmentCheckMonitor, err := monitor.NewFakeEnvironmentCheckMonitor(nc.logger, nc.ds, controllerID, enqueueNodeForMonitor)
+	if err != nil {
+		return nil, err
+	}
+	nc.environmentCheckMonitor = environmentCheckMonitor
+
+	cpuPolicyCheckMonitor, err := monitor.NewFakeCPUPolicyCheckMonitor(nc.logger, nc.ds, controllerID, enqueueNodeForMonitor)
+	if err != nil {
+		return nil, err
+	}
+	nc.cpuPolicyCheckMonitor = cpuPolicyCheckMonitor
+
+	for index := range nc.cacheSyncs {
+		nc.cacheSyncs[index] = alwaysReady
+	}
+	return nc, nil
+}
+
+func fakeTopologyLabelsChecker(kubeClient clientset.Interface, vers string) (bool, error) {
+	return false, nil
+}
+
+// ---------------------------------------------------------------------------
+// Linked-clone eviction tests
+// ---------------------------------------------------------------------------
+
+// newSrcReplica returns a non-clone replica on the given node/disk.
+func newSrcReplica(name, volumeName, nodeID, diskID string) *longhorn.Replica {
+	return &longhorn.Replica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: TestNamespace,
+			Labels: map[string]string{
+				types.LonghornNodeKey:     nodeID,
+				types.LonghornDiskUUIDKey: diskID,
+			},
+		},
+		Spec: longhorn.ReplicaSpec{
+			InstanceSpec: longhorn.InstanceSpec{
+				NodeID:     nodeID,
+				VolumeName: volumeName,
+			},
+			DiskID: diskID,
+		},
+	}
+}
+
+// newCloneReplica returns a linked-clone replica whose source replica is srcName.
+func newCloneReplica(name, volumeName, nodeID, diskID, srcName string) *longhorn.Replica {
+	return &longhorn.Replica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      name,
+			Namespace: TestNamespace,
+			Labels: map[string]string{
+				types.LonghornNodeKey:     nodeID,
+				types.LonghornDiskUUIDKey: diskID,
+				types.GetLonghornLabelKey(types.LonghornLabelLinkedCloneSrcReplica): srcName,
+			},
+		},
+		Spec: longhorn.ReplicaSpec{
+			InstanceSpec: longhorn.InstanceSpec{
+				NodeID:     nodeID,
+				VolumeName: volumeName,
+			},
+			DiskID:                    diskID,
+			LinkedCloneSrcReplicaName: srcName,
+		},
+	}
+}
+
+func (s *NodeControllerSuite) TestLinkedCloneEviction(c *C) {
+	// ----------------------------------------------------------------
+	// Test 1 — Manual disk eviction: both evicted
+	//
+	// Disk EvictionRequested=true triggers shouldEvictReplica for every
+	// replica on that disk regardless of drain policy or node cordoning.
+	// ----------------------------------------------------------------
+	{
+		s.SetUpTest(c)
+
+		lhNode := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, "")
+		disk := lhNode.Spec.Disks[TestDiskID1]
+		disk.EvictionRequested = true
+		lhNode.Spec.Disks[TestDiskID1] = disk
+		lhNode.Status.DiskStatus[TestDiskID1].ScheduledReplica = map[string]int64{
+			"src-replica": 0, "clone-replica": 0,
+		}
+
+		kubeNode := newKubernetesNode(TestNode1,
+			corev1.ConditionTrue, corev1.ConditionFalse, corev1.ConditionFalse,
+			corev1.ConditionFalse, corev1.ConditionFalse, corev1.ConditionTrue)
+
+		s.initTest(c, &NodeControllerFixture{
+			lhNodes: map[string]*longhorn.Node{TestNode1: lhNode},
+			lhReplicas: []*longhorn.Replica{
+				newSrcReplica("src-replica", "src-volume", TestNode1, TestDiskID1),
+				newCloneReplica("clone-replica", "clone-volume", TestNode1, TestDiskID1, "src-replica"),
+			},
+			lhSettings: map[string]*longhorn.Setting{
+				string(types.SettingNameNodeDrainPolicy): newSetting(
+					string(types.SettingNameNodeDrainPolicy),
+					string(types.NodeDrainPolicyBlockIfContainsLastReplica)),
+			},
+			nodes: map[string]*corev1.Node{TestNode1: kubeNode},
+		})
+
+		err := s.controller.syncReplicaEvictionRequested(lhNode, kubeNode)
+		c.Assert(err, IsNil)
+
+		r, err := s.lhClient.LonghornV1beta2().Replicas(TestNamespace).Get(
+			context.TODO(), "src-replica", metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(r.Spec.EvictionRequested, Equals, true)
+
+		r, err = s.lhClient.LonghornV1beta2().Replicas(TestNamespace).Get(
+			context.TODO(), "clone-replica", metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(r.Spec.EvictionRequested, Equals, true)
+	}
+
+	// ----------------------------------------------------------------
+	// Test 2 — block-for-eviction + cordoned: both evicted
+	//
+	// NodeDrainPolicy=block-for-eviction and node is cordoned: every replica
+	// including src and clone on the node is unconditionally evicted.
+	// ----------------------------------------------------------------
+	{
+		s.SetUpTest(c)
+
+		lhNode := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, "")
+		lhNode.Status.DiskStatus[TestDiskID1].ScheduledReplica = map[string]int64{
+			"src-replica": 0, "clone-replica": 0,
+		}
+
+		kubeNode := newKubernetesNode(TestNode1,
+			corev1.ConditionTrue, corev1.ConditionFalse, corev1.ConditionFalse,
+			corev1.ConditionFalse, corev1.ConditionFalse, corev1.ConditionTrue)
+		kubeNode.Spec.Unschedulable = true
+
+		s.initTest(c, &NodeControllerFixture{
+			lhNodes: map[string]*longhorn.Node{TestNode1: lhNode},
+			lhReplicas: []*longhorn.Replica{
+				newSrcReplica("src-replica", "src-volume", TestNode1, TestDiskID1),
+				newCloneReplica("clone-replica", "clone-volume", TestNode1, TestDiskID1, "src-replica"),
+			},
+			lhSettings: map[string]*longhorn.Setting{
+				string(types.SettingNameNodeDrainPolicy): newSetting(
+					string(types.SettingNameNodeDrainPolicy),
+					string(types.NodeDrainPolicyBlockForEviction)),
+			},
+			nodes: map[string]*corev1.Node{TestNode1: kubeNode},
+		})
+
+		err := s.controller.syncReplicaEvictionRequested(lhNode, kubeNode)
+		c.Assert(err, IsNil)
+
+		r, err := s.lhClient.LonghornV1beta2().Replicas(TestNamespace).Get(
+			context.TODO(), "src-replica", metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(r.Spec.EvictionRequested, Equals, true)
+
+		r, err = s.lhClient.LonghornV1beta2().Replicas(TestNamespace).Get(
+			context.TODO(), "clone-replica", metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(r.Spec.EvictionRequested, Equals, true)
+	}
+
+	// ----------------------------------------------------------------
+	// Test 3 — block-for-eviction-if-contains-last-replica + cordoned
+	//          (both last): both evicted
+	//
+	// No IM/PDB objects are registered in the fixture, so
+	// ListVolumePDBProtectedHealthyReplicasRO returns empty for every
+	// volume → hasPDBOnAnotherNode=false → shouldEvictReplica=true.
+	// Both src and clone are in ScheduledReplica and are treated as
+	// "last healthy replica", so both are evicted by the main loop.
+	// ----------------------------------------------------------------
+	{
+		s.SetUpTest(c)
+
+		lhNode := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, "")
+		lhNode.Status.DiskStatus[TestDiskID1].ScheduledReplica = map[string]int64{
+			"src-replica": 0, "clone-replica": 0,
+		}
+
+		kubeNode := newKubernetesNode(TestNode1,
+			corev1.ConditionTrue, corev1.ConditionFalse, corev1.ConditionFalse,
+			corev1.ConditionFalse, corev1.ConditionFalse, corev1.ConditionTrue)
+		kubeNode.Spec.Unschedulable = true
+
+		s.initTest(c, &NodeControllerFixture{
+			lhNodes: map[string]*longhorn.Node{TestNode1: lhNode},
+			lhReplicas: []*longhorn.Replica{
+				newSrcReplica("src-replica", "src-volume", TestNode1, TestDiskID1),
+				newCloneReplica("clone-replica", "clone-volume", TestNode1, TestDiskID1, "src-replica"),
+			},
+			lhSettings: map[string]*longhorn.Setting{
+				string(types.SettingNameNodeDrainPolicy): newSetting(
+					string(types.SettingNameNodeDrainPolicy),
+					string(types.NodeDrainPolicyBlockForEvictionIfContainsLastReplica)),
+			},
+			nodes: map[string]*corev1.Node{TestNode1: kubeNode},
+		})
+
+		err := s.controller.syncReplicaEvictionRequested(lhNode, kubeNode)
+		c.Assert(err, IsNil)
+
+		r, err := s.lhClient.LonghornV1beta2().Replicas(TestNamespace).Get(
+			context.TODO(), "src-replica", metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(r.Spec.EvictionRequested, Equals, true)
+
+		r, err = s.lhClient.LonghornV1beta2().Replicas(TestNamespace).Get(
+			context.TODO(), "clone-replica", metav1.GetOptions{})
+		c.Assert(err, IsNil)
+		c.Assert(r.Spec.EvictionRequested, Equals, true)
+	}
+}
+
+// TestAlignDiskSpecAndStatusRecordsConfiguredDiskPath covers longhorn/longhorn#13893:
+// without the configured path in the status, a disk whose creation failed leaves
+// nothing behind to identify the device that has to be released.
+func (s *NodeControllerSuite) TestAlignDiskSpecAndStatusRecordsConfiguredDiskPath(c *C) {
+	node := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, "")
+	node.Spec.Disks = map[string]longhorn.DiskSpec{
+		TestDiskID1: {
+			Type:            longhorn.DiskTypeBlock,
+			Path:            "0000:05:00.0",
+			DiskDriver:      longhorn.DiskDriverAuto,
+			AllowScheduling: true,
+		},
+	}
+	// A fresh disk starts with no recorded path, so the configured path must be
+	// filled in before creation to identify the device on removal.
+	node.Status.DiskStatus = map[string]*longhorn.DiskStatus{}
+
+	s.controller.alignDiskSpecAndStatus(node)
+
+	diskStatus, ok := node.Status.DiskStatus[TestDiskID1]
+	c.Assert(ok, Equals, true)
+	c.Assert(diskStatus.DiskPath, Equals, "0000:05:00.0")
+}
+
+// TestAlignDiskSpecAndStatusDropsRemovedDisks covers longhorn/longhorn#13893:
+// a removed disk must not keep a status entry, since the node validator rejects
+// every node update while the spec and the status disks disagree.
+func (s *NodeControllerSuite) TestAlignDiskSpecAndStatusDropsRemovedDisks(c *C) {
+	node := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, "")
+	node.Spec.Disks = map[string]longhorn.DiskSpec{}
+	node.Status.DiskStatus = map[string]*longhorn.DiskStatus{
+		"block-disk": {
+			Type:     longhorn.DiskTypeBlock,
+			DiskPath: "0000:05:00.0",
+		},
+		"filesystem-disk": {
+			Type:     longhorn.DiskTypeFilesystem,
+			DiskPath: TestDefaultDataPath,
+		},
+	}
+
+	// There is no running instance manager, so releasing the block device fails.
+	s.controller.alignDiskSpecAndStatus(node)
+
+	c.Assert(node.Status.DiskStatus, HasLen, 0)
+}
+
+func (s *NodeControllerSuite) TestAlignDiskSpecAndStatusDropsNilDiskStatus(c *C) {
+	node := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, "")
+	node.Spec.Disks = map[string]longhorn.DiskSpec{}
+	node.Status.DiskStatus = map[string]*longhorn.DiskStatus{"stale-disk": nil}
+
+	s.controller.alignDiskSpecAndStatus(node)
+
+	_, ok := node.Status.DiskStatus["stale-disk"]
+	c.Assert(ok, Equals, false)
+}
+
+// TestAlignDiskSpecAndStatusKeepsFilesystemDiskUntouched guards the block-disk
+// path recording from changing how filesystem-type disks are handled.
+func (s *NodeControllerSuite) TestAlignDiskSpecAndStatusKeepsFilesystemDiskUntouched(c *C) {
+	node := newNode(TestNode1, TestNamespace, true, longhorn.ConditionStatusTrue, "")
+	specDiskPath := node.Spec.Disks[TestDiskID1].Path
+
+	s.controller.alignDiskSpecAndStatus(node)
+
+	diskStatus, ok := node.Status.DiskStatus[TestDiskID1]
+	c.Assert(ok, Equals, true)
+	c.Assert(diskStatus.Type, Equals, longhorn.DiskTypeFilesystem)
+	c.Assert(diskStatus.DiskPath, Equals, specDiskPath)
+	c.Assert(types.GetCondition(diskStatus.Conditions, longhorn.DiskConditionTypeReady).Status, Equals, longhorn.ConditionStatusTrue)
+}

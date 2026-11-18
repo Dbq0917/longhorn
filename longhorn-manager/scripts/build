@@ -1,0 +1,42 @@
+#!/bin/bash
+set -e -x
+
+source $(dirname $0)/version
+
+LINKFLAGS="-X github.com/longhorn/longhorn-manager/meta.Version=$VERSION
+           -X github.com/longhorn/longhorn-manager/meta.GitCommit=$GITCOMMIT
+           -X github.com/longhorn/longhorn-manager/meta.BuildDate=$BUILDDATE
+           -X github.com/longhorn/longhorn-manager/meta.TwoMinorUpgradeDistros=${LONGHORN_TWO_MINOR_UPGRADE_DISTROS}"
+[ "$(uname)" != "Darwin" ] && OTHER_LINKFLAGS="-extldflags -static -s"
+
+# add coverage flags if there is no tag and it's on master or a version branch like v1.6.x
+COMMIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
+COMMIT_TAG=$(git tag --points-at HEAD | head -n 1)
+if [[ "$COMMIT_TAG" == "" ]] && [[ "$COMMIT_BRANCH" == master || "$COMMIT_BRANCH" =~ ^v[0-9]+\.[0-9]+\.x$ ]]; then
+    COVER="-cover"
+    COVERPKG="-coverpkg=github.com/longhorn/longhorn-manager/..."
+fi
+
+cd $(dirname $0)/..
+
+mkdir -p bin
+
+ARCHS=${ARCHS:-''}
+if [[ -z "${ARCHS}" ]]; then
+    case $(uname -m) in
+    aarch64 | arm64)
+        ARCHS=(arm64)
+        ;;
+    x86_64)
+        ARCHS=(amd64)
+        ;;
+    *)
+        echo "$(uname -a): unsupported architecture"
+        exit 1
+    esac
+else
+    IFS=' ' read -r -a ARCHS <<<"${ARCHS}"
+fi
+for arch in "${ARCHS[@]}"; do
+    CGO_ENABLED=0 GOARCH=${arch} go build -o bin/longhorn-manager-${arch} -ldflags "${LINKFLAGS} ${OTHER_LINKFLAGS}" ${COVER} ${COVERPKG}
+done

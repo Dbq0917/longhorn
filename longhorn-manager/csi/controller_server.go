@@ -1,0 +1,1772 @@
+package csi
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"os"
+	"reflect"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"github.com/container-storage-interface/spec/lib/go/csi"
+	"github.com/sirupsen/logrus"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/timestamppb"
+	"google.golang.org/protobuf/types/known/wrapperspb"
+
+	"k8s.io/client-go/rest"
+
+	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/longhorn/longhorn-manager/datastore"
+	"github.com/longhorn/longhorn-manager/types"
+	"github.com/longhorn/longhorn-manager/util"
+
+	longhornclient "github.com/longhorn/longhorn-manager/client"
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	lhclientset "github.com/longhorn/longhorn-manager/k8s/pkg/client/clientset/versioned"
+)
+
+const (
+	// we wait 1m30s for the volume state polling, this leaves 20s for the rest of the function call
+	timeoutAttachDetach         = 90 * time.Second
+	tickAttachDetach            = 2 * time.Second
+	timeoutBackupControllerSync = 30 * time.Second
+	tickBackupControllerSync    = 2 * time.Second
+	backupStateCompleted        = "Completed"
+	timeoutSnapshotCreation     = 90 * time.Second
+	tickSnapshotCreation        = 2 * time.Second
+	timeoutSnapshotDeletion     = 90 * time.Second
+	tickSnapshotDeletion        = 2 * time.Second
+
+	csiSnapshotTypeLonghornSnapshot         = "snap"
+	csiSnapshotTypeLonghornBackingImage     = "bi"
+	csiSnapshotTypeLonghornBackup           = "bak"
+	deprecatedCSISnapshotTypeLonghornBackup = "bs"
+)
+
+type ControllerServer struct {
+	csi.UnimplementedControllerServer
+	apiClient   *longhornclient.RancherClient
+	nodeID      string
+	caps        []*csi.ControllerServiceCapability
+	accessModes []*csi.VolumeCapability_AccessMode
+	log         *logrus.Entry
+	lhClient    lhclientset.Interface
+	lhNamespace string
+}
+
+func NewControllerServer(apiClient *longhornclient.RancherClient, nodeID string) (*ControllerServer, error) {
+	lhNamespace := os.Getenv(types.EnvPodNamespace)
+	if lhNamespace == "" {
+		return nil, fmt.Errorf("failed to detect pod namespace, environment variable %v is missing", types.EnvPodNamespace)
+	}
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get client config")
+	}
+
+	lhClient, err := lhclientset.NewForConfig(config)
+	if err != nil {
+		return nil, errors.Wrap(err, "failed to get longhorn clientset")
+	}
+
+	return &ControllerServer{
+		apiClient: apiClient,
+		nodeID:    nodeID,
+		caps: getControllerServiceCapabilities(
+			[]csi.ControllerServiceCapability_RPC_Type{
+				csi.ControllerServiceCapability_RPC_CREATE_DELETE_VOLUME,
+				csi.ControllerServiceCapability_RPC_PUBLISH_UNPUBLISH_VOLUME,
+				csi.ControllerServiceCapability_RPC_EXPAND_VOLUME,
+				csi.ControllerServiceCapability_RPC_CREATE_DELETE_SNAPSHOT,
+				csi.ControllerServiceCapability_RPC_CLONE_VOLUME,
+				csi.ControllerServiceCapability_RPC_GET_CAPACITY,
+				csi.ControllerServiceCapability_RPC_SINGLE_NODE_MULTI_WRITER,
+			}),
+		accessModes: getVolumeCapabilityAccessModes(
+			[]csi.VolumeCapability_AccessMode_Mode{
+				csi.VolumeCapability_AccessMode_SINGLE_NODE_WRITER,
+				csi.VolumeCapability_AccessMode_SINGLE_NODE_SINGLE_WRITER,
+				csi.VolumeCapability_AccessMode_SINGLE_NODE_MULTI_WRITER,
+				csi.VolumeCapability_AccessMode_MULTI_NODE_MULTI_WRITER,
+			}),
+		log:         logrus.StandardLogger().WithField("component", "csi-controller-server"),
+		lhClient:    lhClient,
+		lhNamespace: lhNamespace,
+	}, nil
+}
+
+func (cs *ControllerServer) CreateVolume(ctx context.Context, req *csi.CreateVolumeRequest) (*csi.CreateVolumeResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "CreateVolume"})
+
+	logCSIRequest(log, "CreateVolume", req)
+
+	volumeID := util.AutoCorrectName(req.GetName(), datastore.NameMaximumLength)
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume id missing in request")
+	}
+	volumeCaps := req.GetVolumeCapabilities()
+	if err := cs.validateVolumeCapabilities(volumeCaps); err != nil {
+		return nil, err
+	}
+	volumeParameters := req.GetParameters()
+	if volumeParameters == nil {
+		volumeParameters = map[string]string{}
+	}
+	var reqVolSizeBytes int64
+	if req.GetCapacityRange() != nil {
+		reqVolSizeBytes = req.GetCapacityRange().GetRequiredBytes()
+	}
+	if reqVolSizeBytes < util.MinimalVolumeSize {
+		log.Infof("Volume %s requested capacity %v is smaller than minimal capacity %v, enforcing minimal capacity.", volumeID, reqVolSizeBytes, util.MinimalVolumeSize)
+		reqVolSizeBytes = util.MinimalVolumeSize
+	}
+	// Round up to multiple of 2 * 1024 * 1024
+	reqVolSizeBytes = util.RoundUpSize(reqVolSizeBytes)
+
+	// Extract AccessibleTopology from AccessibilityRequirements
+	// This will be used to set PV nodeAffinity via external-provisioner
+
+	var accessibleTopology []*csi.Topology
+
+	if volumeParameters["dataLocality"] == string(longhorn.DataLocalityStrictLocal) {
+		log.Infof(
+			"CreateVolume for %s ignores AccessibilityRequirements because dataLocality is strict-local; the volume will be created only on the requested node",
+			volumeID,
+		)
+	} else {
+		strictTopology := volumeParameters["strictTopology"] == "true"
+		accessibleTopology = cs.getAccessibleTopologyFromRequirements(ctx, req.GetAccessibilityRequirements(), strictTopology)
+	}
+
+	volumeSource := req.GetVolumeContentSource()
+	if volumeSource != nil {
+		switch volumeSource.Type.(type) {
+		case *csi.VolumeContentSource_Snapshot:
+			if snapshot := volumeSource.GetSnapshot(); snapshot != nil {
+				csiSnapshotType, sourceVolumeName, id := decodeSnapshotID(snapshot.SnapshotId)
+				switch csiSnapshotType {
+				case csiSnapshotTypeLonghornBackingImage:
+					backingImageParameters := decodeSnapshoBackingImageID(snapshot.SnapshotId)
+					if backingImageParameters[longhorn.BackingImageParameterName] == "" || backingImageParameters[longhorn.BackingImageParameterDataSourceType] == "" {
+						return nil, status.Errorf(codes.InvalidArgument, "invalid CSI snapshotHandle %v for backing image", snapshot.SnapshotId)
+					}
+					updateVolumeParamsForBackingImage(volumeParameters, backingImageParameters)
+				case csiSnapshotTypeLonghornSnapshot:
+					if id == "" {
+						return nil, status.Errorf(codes.NotFound, "volume source snapshot %v is not found", snapshot.SnapshotId)
+					}
+					dataSource, _ := types.NewVolumeDataSource(longhorn.VolumeDataSourceTypeSnapshot, map[string]string{types.VolumeNameKey: sourceVolumeName, types.SnapshotNameKey: id})
+					volumeParameters["dataSource"] = string(dataSource)
+				case csiSnapshotTypeLonghornBackup:
+					if id == "" {
+						return nil, status.Errorf(codes.NotFound, "volume source snapshot %v is not found", snapshot.SnapshotId)
+					}
+					backupName := id
+					bvs, err := cs.getBackupVolumes(sourceVolumeName)
+					if err != nil {
+						return nil, status.Errorf(codes.Internal, "failed to retrieve backup volumes of volume %v: %v", sourceVolumeName, err)
+					}
+					if len(bvs) == 0 {
+						return nil, status.Errorf(codes.NotFound, "failed to restore CSI snapshot %v of volume %v: there is no backup volume", snapshot.SnapshotId, sourceVolumeName)
+					}
+					var backup *longhornclient.Backup
+					for _, bv := range bvs {
+						backup, err = cs.apiClient.BackupVolume.ActionBackupGet(bv, &longhornclient.BackupInput{Name: backupName})
+						if err != nil {
+							return nil, status.Errorf(codes.NotFound, "failed to restore CSI snapshot %v : failed to get backup %v: %v", snapshot.SnapshotId, backupName, err)
+						}
+						if backup != nil {
+							break
+						}
+					}
+					if backup == nil {
+						return nil, status.Errorf(codes.NotFound, "failed to restore CSI snapshot %v backup %s unavailable", snapshot.SnapshotId, backupName)
+					}
+
+					// use the fromBackup method for the csi snapshot restores as well
+					// the same parameter was previously only used for restores based on the storage class
+					volumeParameters["fromBackup"] = backup.Url
+				default:
+					return nil, status.Errorf(codes.InvalidArgument, "invalid CSI snapshot type: %v. Must be %v, %v or %v",
+						csiSnapshotType, csiSnapshotTypeLonghornSnapshot, csiSnapshotTypeLonghornBackup, csiSnapshotTypeLonghornBackingImage)
+				}
+			}
+		case *csi.VolumeContentSource_Volume:
+			if srcVolume := volumeSource.GetVolume(); srcVolume != nil {
+				longhornSrcVol, err := cs.apiClient.Volume.ById(srcVolume.VolumeId)
+				if err != nil {
+					return nil, status.Errorf(codes.NotFound, "failed to clone volume: source volume %s is unavailable", srcVolume.VolumeId)
+				}
+				if longhornSrcVol == nil {
+					return nil, status.Errorf(codes.NotFound, "failed to clone volume: source volume %s is not found", srcVolume.VolumeId)
+				}
+
+				// check size of source and requested
+				srcVolSizeBytes, err := strconv.ParseInt(longhornSrcVol.Size, 10, 64)
+				if err != nil {
+					return nil, status.Errorf(codes.Internal, "%v", err)
+				}
+				if reqVolSizeBytes != srcVolSizeBytes {
+					return nil, status.Errorf(codes.OutOfRange, "failed to clone volume: the requested size (%v bytes) is different than the source volume size (%v bytes)", reqVolSizeBytes, srcVolSizeBytes)
+				}
+
+				dataSource, _ := types.NewVolumeDataSource(longhorn.VolumeDataSourceTypeVolume, map[string]string{types.VolumeNameKey: srcVolume.VolumeId})
+				volumeParameters["dataSource"] = string(dataSource)
+			}
+		default:
+			return nil, status.Errorf(codes.InvalidArgument, "%v not a proper volume source", volumeSource)
+		}
+	} else {
+		// Refuse to create a NEW XFS volume smaller than 300 MiB, since mkfs.xfs will eventually fail in the node
+		// server. Don't refuse for clones/restores though, as they may have an existing filesystem.
+		for _, cap := range req.VolumeCapabilities {
+			if cap.GetMount().GetFsType() == "xfs" && reqVolSizeBytes < util.MinimalVolumeSizeXFS {
+				return nil, fmt.Errorf("XFS filesystems with size %d, smaller than %d, are not supported",
+					reqVolSizeBytes, util.MinimalVolumeSizeXFS)
+			}
+		}
+	}
+
+	existVol, err := cs.apiClient.Volume.ById(volumeID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if existVol != nil {
+		log.Infof("Volume %v already exists with name %v", volumeID, existVol.Name)
+
+		exVolSize, err := util.ConvertSize(existVol.Size)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+
+		if exVolSize != reqVolSizeBytes {
+			return nil, status.Errorf(codes.AlreadyExists, "volume %s size %v differs from requested size %v", existVol.Name, exVolSize, reqVolSizeBytes)
+		}
+
+		// pass through the volume content source in case this volume is in the process of being created.
+		// We won't wait for clone/restore to complete but return OK immediately here so that
+		// if Kubernetes wants to abort/delete the cloning/restoring volume, it has the volume ID and is able to do so.
+		// We will wait for clone/restore to complete inside ControllerPublishVolume.
+		rsp := &csi.CreateVolumeResponse{
+			Volume: &csi.Volume{
+				VolumeId:           existVol.Id,
+				CapacityBytes:      exVolSize,
+				VolumeContext:      volumeParameters,
+				ContentSource:      volumeSource,
+				AccessibleTopology: accessibleTopology,
+			},
+		}
+
+		return rsp, nil
+	}
+
+	// regardless of the used storage class, if this is requested in rwx mode
+	// we need to mark the volume as a shared volume
+	for _, cap := range volumeCaps {
+		if requiresSharedAccess(nil, cap) {
+			volumeParameters["share"] = strconv.FormatBool(true)
+			break
+		}
+		if requireExclusiveAccess(nil, cap) {
+			volumeParameters["exclusive"] = strconv.FormatBool(true)
+			break
+		}
+	}
+
+	vol, err := getVolumeOptions(volumeID, volumeParameters)
+	if err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	if err = cs.checkAndPrepareBackingImage(volumeID, vol.BackingImage, volumeParameters, vol.DataEngine); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
+
+	vol.Name = volumeID
+	vol.Size = fmt.Sprintf("%d", reqVolSizeBytes)
+
+	log.Infof("Creating a volume by API client, name: %s, size: %s, accessMode: %v, dataEngine: %v",
+		vol.Name, vol.Size, vol.AccessMode, vol.DataEngine)
+	resVol, err := cs.apiClient.Volume.Create(vol)
+	// TODO: implement error response code for Longhorn API to differentiate different error type.
+	// For example, creating a volume from a non-existing snapshot should return codes.NotFound instead of codes.Internal
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	checkVolumeCreated := func(vol *longhornclient.Volume) bool {
+		// This condition should be enough to return OK to the CSI CreateVolume request.
+		// The volume may be still downloading data from backup target or from a different volume,
+		// and we will wait for this process to finish before allowing the workload pod to use the volume
+		// in the ControllerPublishVolume call
+		return vol.State != "" && vol.State != string(longhorn.VolumeStateCreating)
+	}
+
+	if !cs.waitForVolumeState(resVol.Id, "volume created", checkVolumeCreated, true, false) {
+		return nil, status.Error(codes.DeadlineExceeded, "failed to wait for volume creation to complete")
+	}
+
+	return &csi.CreateVolumeResponse{
+		Volume: &csi.Volume{
+			VolumeId:           resVol.Id,
+			CapacityBytes:      reqVolSizeBytes,
+			VolumeContext:      volumeParameters,
+			ContentSource:      volumeSource,
+			AccessibleTopology: accessibleTopology,
+		},
+	}, nil
+}
+
+func (cs *ControllerServer) getBackupVolumes(volumeName string) ([]*longhornclient.BackupVolume, error) {
+	bvs := []*longhornclient.BackupVolume{}
+	log := cs.log.WithFields(logrus.Fields{"function": "getBackupVolume"})
+	list, err := cs.apiClient.BackupVolume.List(&longhornclient.ListOpts{})
+	if err != nil {
+		return nil, err
+	}
+	for _, bv := range list.Data {
+		if bv.VolumeName == volumeName {
+			bvs = append(bvs, &bv)
+		}
+	}
+	if len(bvs) == 0 {
+		log.Debugf("cannot find backup volume for volume %s", volumeName)
+	}
+	return bvs, nil
+}
+
+func (cs *ControllerServer) checkAndPrepareBackingImage(volumeName, backingImageName string, volumeParameters map[string]string, dataEngine string) error {
+	if backingImageName == "" {
+		return nil
+	}
+
+	bidsType := volumeParameters[longhorn.BackingImageParameterDataSourceType]
+	biChecksum := volumeParameters[longhorn.BackingImageParameterChecksum]
+	bidsParameters := map[string]string{}
+	if bidsParametersStr := volumeParameters[longhorn.BackingImageParameterDataSourceParameters]; bidsParametersStr != "" {
+		if err := json.Unmarshal([]byte(bidsParametersStr), &bidsParameters); err != nil {
+			return fmt.Errorf("volume %s is unable to create missing backing image with parameters %s: %v", volumeName, bidsParametersStr, err)
+		}
+	}
+
+	// There will be an empty BackingImage object rather than nil returned even if there is an error
+	existingBackingImage, err := cs.apiClient.BackingImage.ById(backingImageName)
+	if err != nil && !strings.Contains(err.Error(), "not found") {
+		return fmt.Errorf("volume %s is unable to retrieve backing image %s: %v", volumeName, backingImageName, err)
+	}
+	// A new backing image will be created automatically
+	// if there is no existing backing image with the name and the type is `download` or `export-from-volume`.
+	if existingBackingImage == nil || existingBackingImage.Name == "" {
+		switch longhorn.BackingImageDataSourceType(bidsType) {
+		case longhorn.BackingImageDataSourceTypeUpload:
+			return fmt.Errorf("volume %s backing image type %v is not supported via CSI", volumeName, bidsType)
+		case longhorn.BackingImageDataSourceTypeDownload:
+			if bidsParameters[longhorn.DataSourceTypeDownloadParameterURL] == "" {
+				return fmt.Errorf("volume %s missing parameters %v for preparing backing image",
+					volumeName, longhorn.DataSourceTypeDownloadParameterURL)
+			}
+		case longhorn.BackingImageDataSourceTypeExportFromVolume:
+			if bidsParameters[longhorn.DataSourceTypeExportParameterExportType] == "" || bidsParameters[longhorn.DataSourceTypeExportParameterVolumeName] == "" {
+				return fmt.Errorf("volume %s missing parameters %v or %v for preparing backing image",
+					volumeName, longhorn.DataSourceTypeExportParameterExportType, longhorn.DataSourceTypeExportParameterVolumeName)
+			}
+		default:
+			return fmt.Errorf("volume %s backing image type %v is not supported via CSI", volumeName, bidsType)
+		}
+
+		backingImage := &longhornclient.BackingImage{
+			Name:             backingImageName,
+			ExpectedChecksum: biChecksum,
+			SourceType:       bidsType,
+			Parameters:       bidsParameters,
+			DataEngine:       dataEngine,
+		}
+
+		if minNumberOfCopies, ok := volumeParameters[longhorn.BackingImageParameterMinNumberOfCopies]; ok {
+			mnoc, err := strconv.Atoi(minNumberOfCopies)
+			if err != nil || mnoc < 0 {
+				return errors.Wrap(err, "invalid parameter minNumberOfCopies of backing image")
+			}
+			backingImage.MinNumberOfCopies = int64(mnoc)
+		}
+
+		if nodeSelector, ok := volumeParameters[longhorn.BackingImageParameterNodeSelector]; ok {
+			backingImage.NodeSelector = strings.Split(nodeSelector, ",")
+		}
+		if diskSelector, ok := volumeParameters[longhorn.BackingImageParameterDiskSelector]; ok {
+			backingImage.DiskSelector = strings.Split(diskSelector, ",")
+		}
+
+		_, err = cs.apiClient.BackingImage.Create(backingImage)
+		return err
+	}
+
+	if (bidsType != "" && bidsType != existingBackingImage.SourceType) || (len(bidsParameters) != 0 && !reflect.DeepEqual(existingBackingImage.Parameters, bidsParameters)) {
+		return fmt.Errorf("existing backing image %v data source is different from the parameters in the creation request or StorageClass", backingImageName)
+	}
+	if biChecksum != "" {
+		if (existingBackingImage.CurrentChecksum != "" && existingBackingImage.CurrentChecksum != biChecksum) ||
+			(existingBackingImage.ExpectedChecksum != "" && existingBackingImage.ExpectedChecksum != biChecksum) {
+			return fmt.Errorf("existing backing image %v expected checksum or current checksum doesn't match the specified checksum %v in the request", backingImageName, biChecksum)
+		}
+	}
+
+	return nil
+}
+
+func (cs *ControllerServer) DeleteVolume(ctx context.Context, req *csi.DeleteVolumeRequest) (*csi.DeleteVolumeResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "DeleteVolume"})
+
+	logCSIRequest(log, "DeleteVolume", req)
+
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume id missing in request")
+	}
+
+	existVol, err := cs.apiClient.Volume.ById(volumeID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if existVol == nil {
+		return &csi.DeleteVolumeResponse{}, nil
+	}
+
+	log.Infof("Deleting volume %v", volumeID)
+	if err = cs.apiClient.Volume.Delete(existVol); err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	checkVolumeDeleted := func(vol *longhornclient.Volume) bool {
+		return vol == nil
+	}
+	if !cs.waitForVolumeState(req.GetVolumeId(), "volume deleted", checkVolumeDeleted, false, true) {
+		return nil, status.Errorf(codes.DeadlineExceeded, "failed to delete volume %s", volumeID)
+	}
+
+	return &csi.DeleteVolumeResponse{}, nil
+}
+
+func (cs *ControllerServer) ControllerGetCapabilities(ctx context.Context, req *csi.ControllerGetCapabilitiesRequest) (*csi.ControllerGetCapabilitiesResponse, error) {
+	return &csi.ControllerGetCapabilitiesResponse{
+		Capabilities: cs.caps,
+	}, nil
+}
+
+func (cs *ControllerServer) ValidateVolumeCapabilities(ctx context.Context, req *csi.ValidateVolumeCapabilitiesRequest) (*csi.ValidateVolumeCapabilitiesResponse, error) {
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume id missing in request")
+	}
+
+	existVol, err := cs.apiClient.Volume.ById(volumeID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if existVol == nil {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
+	}
+
+	if err := cs.validateVolumeCapabilities(req.GetVolumeCapabilities()); err != nil {
+		return nil, err
+	}
+
+	return &csi.ValidateVolumeCapabilitiesResponse{
+		Confirmed: &csi.ValidateVolumeCapabilitiesResponse_Confirmed{
+			VolumeContext:      req.GetVolumeContext(),
+			VolumeCapabilities: req.GetVolumeCapabilities(),
+			Parameters:         req.GetParameters(),
+		},
+	}, nil
+}
+
+// ControllerPublishVolume will attach the volume to the specified node
+func (cs *ControllerServer) ControllerPublishVolume(ctx context.Context, req *csi.ControllerPublishVolumeRequest) (*csi.ControllerPublishVolumeResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "ControllerPublishVolume"})
+
+	logCSIRequest(log, "ControllerPublishVolume", req)
+
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume id missing in request")
+	}
+
+	nodeID := req.GetNodeId()
+	if nodeID == "" {
+		return nil, status.Error(codes.InvalidArgument, "node id missing in request")
+	}
+
+	volumeCapability := req.GetVolumeCapability()
+	if volumeCapability == nil {
+		return nil, status.Error(codes.InvalidArgument, "volume capability missing in request")
+	}
+
+	// TODO: #1875 API returns error instead of not found, so we cannot differentiate between a retrieval failure and non existing resource
+	if _, err := cs.apiClient.Node.ById(nodeID); err != nil {
+		return nil, status.Errorf(codes.NotFound, "node %s not found", nodeID)
+	}
+
+	volume, err := cs.apiClient.Volume.ById(volumeID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if volume == nil {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", volumeID)
+	}
+
+	if volume.Frontend != string(longhorn.VolumeFrontendBlockDev) &&
+		volume.Frontend != string(longhorn.VolumeFrontendUblk) {
+		return nil, status.Errorf(codes.InvalidArgument, "volume %s invalid frontend type %s", volumeID, volume.Frontend)
+	}
+
+	if requiresSharedAccess(volume, volumeCapability) {
+		volume, err = cs.updateVolumeAccessMode(volume, longhorn.AccessModeReadWriteMany)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if requireExclusiveAccess(volume, volumeCapability) {
+		volume, err = cs.updateVolumeAccessMode(volume, longhorn.AccessModeReadWriteOncePod)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// TODO: JM Restore should be handled by the volume attach call, consider returning `codes.Aborted`
+	// TODO: JM should readiness be handled by the caller?
+	//  Most of the readiness conditions are covered by the attach, except auto attachment which requires changes to the design
+	//  should be handled by the processing of the api return codes
+	if !volume.Ready {
+		if volume.NotReadyMessage != "" {
+			return nil, status.Errorf(codes.Aborted, "volume %s is not ready for workloads: %v", volumeID, volume.NotReadyMessage)
+		}
+		return nil, status.Errorf(codes.Aborted, "volume %s is not ready for workloads", volumeID)
+	}
+
+	attachmentID := generateAttachmentID(volumeID, nodeID)
+
+	return cs.publishVolume(volume, nodeID, attachmentID, func() error {
+		checkVolumePublished := func(vol *longhornclient.Volume) bool {
+			isRegularRWXVolume := vol.AccessMode == string(longhorn.AccessModeReadWriteMany) && !vol.Migratable
+			attachment, ok := vol.VolumeAttachment.Attachments[attachmentID]
+			if isRegularRWXVolume {
+				return ok && attachment.Satisfied
+			}
+			return ok && attachment.Satisfied && isVolumeAvailableOn(vol, nodeID)
+		}
+		if !cs.waitForVolumeState(volumeID, "volume published", checkVolumePublished, false, false) {
+			// check if there is error while attaching
+			if existVol, err := cs.apiClient.Volume.ById(volumeID); err == nil && existVol != nil {
+				if attachment, ok := existVol.VolumeAttachment.Attachments[attachmentID]; ok {
+					for _, condition := range attachment.Conditions {
+						if condition.Type == longhorn.AttachmentStatusConditionTypeSatisfied && condition.Status == string(longhorn.ConditionStatusFalse) && condition.Message != "" {
+							return status.Errorf(codes.Internal, "volume %v failed to attach to node %v with attachmentID %v: %v", volumeID, nodeID, attachmentID, condition.Message)
+						}
+					}
+				}
+			}
+			return status.Errorf(codes.DeadlineExceeded, "volume %v failed to attach to node %v with attachmentID %v", volumeID, nodeID, attachmentID)
+		}
+		return nil
+	})
+}
+
+// We pick the same name as the volume attachment object at
+// https://github.com/kubernetes/kubernetes/blob/f1e74f77ff88abb7acf0fb0e86ba21bc0f2395c9/pkg/volume/csi/csi_attacher.go#L653-L656
+func generateAttachmentID(volName, nodeID string) string {
+	result := sha256.Sum256([]byte(fmt.Sprintf("%s%s%s", volName, types.LonghornDriverName, nodeID)))
+	return fmt.Sprintf("csi-%x", result)
+}
+
+// publishVolume sends the actual attach request to the longhorn api and executes the passed waitForResult func
+func (cs *ControllerServer) publishVolume(volume *longhornclient.Volume, nodeID, attachmentID string, waitForResult func() error) (*csi.ControllerPublishVolumeResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "publishVolume"})
+
+	input := &longhornclient.AttachInput{
+		HostId:          nodeID,
+		DisableFrontend: false,
+		AttacherType:    string(longhorn.AttacherTypeCSIAttacher),
+		AttachmentID:    attachmentID,
+	}
+
+	log.Infof("Volume %v with accessMode %v requesting publishing with attachInput %+v", volume.Name, volume.AccessMode, input)
+	if _, err := cs.apiClient.Volume.ActionAttach(volume, input); err != nil {
+		// TODO: JM process the returned error and return the correct error responses for kubernetes
+		//  i.e. FailedPrecondition if the RWO volume is already attached to a different node
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if err := waitForResult(); err != nil {
+		return nil, err
+	}
+
+	return &csi.ControllerPublishVolumeResponse{}, nil
+}
+
+func (cs *ControllerServer) updateVolumeAccessMode(volume *longhornclient.Volume, accessMode longhorn.AccessMode) (*longhornclient.Volume, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "updateVolumeAccessMode"})
+
+	mode := string(accessMode)
+	if volume.AccessMode == mode {
+		return volume, nil
+	}
+
+	volumeName := volume.Name
+	input := &longhornclient.UpdateAccessModeInput{AccessMode: mode}
+
+	log.Infof("Changing volume %s access mode to %s", volumeName, mode)
+	volume, err := cs.apiClient.Volume.ActionUpdateAccessMode(volume, input)
+	if err != nil {
+		log.WithError(err).Errorf("Failed to change volume %s access mode to %s", volumeName, mode)
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	return volume, nil
+}
+
+// ControllerUnpublishVolume will detach the volume
+func (cs *ControllerServer) ControllerUnpublishVolume(ctx context.Context, req *csi.ControllerUnpublishVolumeRequest) (*csi.ControllerUnpublishVolumeResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "ControllerUnpublishVolume"})
+
+	logCSIRequest(log, "ControllerUnpublishVolume", req)
+
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume id missing in request")
+	}
+
+	nodeID := req.GetNodeId()
+
+	volume, err := cs.apiClient.Volume.ById(volumeID)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	// VOLUME_NOT_FOUND is no longer the ControllerUnpublishVolume error
+	// See https://github.com/container-storage-interface/spec/issues/382 for details
+	if volume == nil {
+		return &csi.ControllerUnpublishVolumeResponse{}, nil
+	}
+
+	attachmentID := generateAttachmentID(volumeID, nodeID)
+
+	// TODO: handle cases in which NodeID is empty. Should we detach the volume from all nodes???
+
+	return cs.unpublishVolume(volume, nodeID, attachmentID, func() error {
+		checkVolumeUnpublished := func(vol *longhornclient.Volume) bool {
+			_, ok := vol.VolumeAttachment.Attachments[attachmentID]
+			return !ok
+		}
+
+		if !cs.waitForVolumeState(volumeID, "volume unpublished", checkVolumeUnpublished, false, true) {
+			return status.Errorf(codes.DeadlineExceeded, "Failed to detach volume %s from node %s", volumeID, nodeID)
+		}
+		return nil
+	})
+}
+
+// unpublishVolume sends the actual detach request to the longhorn api and executes the passed waitForResult func
+func (cs *ControllerServer) unpublishVolume(volume *longhornclient.Volume, nodeID, attachmentID string, waitForResult func() error) (*csi.ControllerUnpublishVolumeResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "unpublishVolume"})
+
+	log.Infof("Requesting volume %v detachment for node %v with attachmentID %v ", volume.Name, nodeID, attachmentID)
+	detachInput := &longhornclient.DetachInput{
+		AttachmentID: attachmentID,
+		HostId:       nodeID,
+		// if nodeID == "" means to detach from all nodes
+		ForceDetach: nodeID == "",
+	}
+	_, err := cs.apiClient.Volume.ActionDetach(volume, detachInput)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	if err = waitForResult(); err != nil {
+		return nil, err
+	}
+
+	return &csi.ControllerUnpublishVolumeResponse{}, nil
+}
+
+func (cs *ControllerServer) ListVolumes(context.Context, *csi.ListVolumesRequest) (*csi.ListVolumesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "")
+}
+
+func (cs *ControllerServer) GetCapacity(ctx context.Context, req *csi.GetCapacityRequest) (rsp *csi.GetCapacityResponse, err error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "GetCapacity"})
+
+	logCSIRequest(log, "GetCapacity", req)
+
+	defer func() {
+		if err != nil {
+			log.WithError(err).Errorf("Failed to get capacity")
+		}
+	}()
+
+	allowEmptyNodeSelectorVolume, err := cs.getSettingAsBoolean(ctx, types.SettingNameAllowEmptyNodeSelectorVolume)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get setting %v: %v", types.SettingNameAllowEmptyNodeSelectorVolume, err)
+	}
+	allowEmptyDiskSelectorVolume, err := cs.getSettingAsBoolean(ctx, types.SettingNameAllowEmptyDiskSelectorVolume)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get setting %v: %v", types.SettingNameAllowEmptyDiskSelectorVolume, err)
+	}
+	overProvisioningPercentage, err := cs.getSettingAsInt(ctx, types.SettingNameStorageOverProvisioningPercentage)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "failed to get setting %v: %v", types.SettingNameStorageOverProvisioningPercentage, err)
+	}
+
+	scParameters := req.GetParameters()
+	var nodeSelector []string
+	if nodeSelectorRaw, ok := scParameters["nodeSelector"]; ok && len(nodeSelectorRaw) > 0 {
+		nodeSelector = strings.Split(nodeSelectorRaw, ",")
+	}
+	var diskSelector []string
+	if diskSelectorRaw, ok := scParameters["diskSelector"]; ok && len(diskSelectorRaw) > 0 {
+		diskSelector = strings.Split(diskSelectorRaw, ",")
+	}
+	dataEngine := longhorn.DataEngineTypeV1
+	if dataEngineType, ok := scParameters["dataEngine"]; ok {
+		dataEngine = longhorn.DataEngineType(dataEngineType)
+	}
+	storageCapacityMode := types.CSIStorageCapacityTrackingModeNode
+	if storageCapacityModeRaw, ok := scParameters["storageCapacityMode"]; ok {
+		storageCapacityMode = types.CSIStorageCapacityTrackingMode(storageCapacityModeRaw)
+	}
+
+	nodeCapacity := func(node *longhorn.Node) (maximumVolumeSize int64, availableCapacity int64) {
+		if types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeReady).Status != longhorn.ConditionStatusTrue {
+			return
+		}
+		if types.GetCondition(node.Status.Conditions, longhorn.NodeConditionTypeSchedulable).Status != longhorn.ConditionStatusTrue {
+			return
+		}
+		if !node.Spec.AllowScheduling || node.Spec.EvictionRequested {
+			return
+		}
+
+		if !types.IsSelectorsInTags(node.Spec.Tags, nodeSelector, allowEmptyNodeSelectorVolume) {
+			return
+		}
+
+		for diskName, diskStatus := range node.Status.DiskStatus {
+			diskSpec, exists := node.Spec.Disks[diskName]
+			if !exists {
+				continue
+			}
+			if !diskSpec.AllowScheduling || diskSpec.EvictionRequested {
+				continue
+			}
+			if types.GetCondition(diskStatus.Conditions, longhorn.DiskConditionTypeSchedulable).Status != longhorn.ConditionStatusTrue {
+				continue
+			}
+			if !types.IsSelectorsInTags(diskSpec.Tags, diskSelector, allowEmptyDiskSelectorVolume) {
+				continue
+			}
+
+			overProvisionLimit := ((diskStatus.StorageMaximum - diskSpec.StorageReserved) * overProvisioningPercentage) / 100
+			storageSchedulable := overProvisionLimit - diskStatus.StorageScheduled
+			storageSchedulable = max(storageSchedulable, 0)
+			validDisk := (dataEngine == longhorn.DataEngineTypeV1 && diskStatus.Type == longhorn.DiskTypeFilesystem) ||
+				(dataEngine == longhorn.DataEngineTypeV2 && diskStatus.Type == longhorn.DiskTypeBlock)
+
+			if validDisk {
+				maximumVolumeSize = max(maximumVolumeSize, storageSchedulable)
+				availableCapacity += storageSchedulable
+			}
+		}
+
+		return maximumVolumeSize, availableCapacity
+	}
+
+	var maximumVolumeSize int64
+	var availableCapacity int64
+	topology := req.GetAccessibleTopology()
+	if topology == nil || len(topology.Segments) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "missing or empty accessible topology request parameter")
+	}
+	switch storageCapacityMode {
+	case types.CSIStorageCapacityTrackingModeNode:
+		nodeID, ok := topology.Segments[corev1.LabelHostname]
+		if !ok {
+			return nil, status.Errorf(codes.InvalidArgument, "missing %q topology segment", corev1.LabelHostname)
+		}
+		node, err := cs.lhClient.LonghornV1beta2().Nodes(cs.lhNamespace).Get(ctx, nodeID, metav1.GetOptions{})
+		if err != nil {
+			if apierrors.IsNotFound(err) {
+				return nil, status.Errorf(codes.NotFound, "node %s not found", nodeID)
+			}
+			return nil, status.Errorf(codes.Internal, "failed to get node: %v", err)
+		}
+		maximumVolumeSize, availableCapacity = nodeCapacity(node)
+		log.Infof("Node: %s, DataEngine: %s, MaximumVolumeSize: %d, AvailableCapacity: %d", nodeID, dataEngine, maximumVolumeSize, availableCapacity)
+	case types.CSIStorageCapacityTrackingModeZone:
+		zone, ok := topology.Segments[corev1.LabelTopologyZone]
+		if !ok {
+			return nil, status.Errorf(codes.InvalidArgument, "missing %q topology segment", corev1.LabelTopologyZone)
+		}
+		nodeList, err := cs.lhClient.LonghornV1beta2().Nodes(cs.lhNamespace).List(ctx, metav1.ListOptions{})
+		if err != nil {
+			return nil, status.Errorf(codes.Internal, "failed to list nodes: %v", err)
+		}
+		for _, node := range nodeList.Items {
+			if node.Status.Zone == zone {
+				nodeMaximumVolumeSize, nodeAvailableCapacity := nodeCapacity(&node)
+				maximumVolumeSize = max(maximumVolumeSize, nodeMaximumVolumeSize)
+				availableCapacity += nodeAvailableCapacity
+			}
+		}
+		log.Infof("Zone: %s, DataEngine: %s, MaximumVolumeSize: %d, AvailableCapacity: %d", zone, dataEngine, maximumVolumeSize, availableCapacity)
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "unexpected value %q for storage class parameter 'storageCapacityMode'", storageCapacityMode)
+	}
+
+	rsp = &csi.GetCapacityResponse{
+		// Used by kube-scheduler to filter nodes that cannot fit the requested
+		// volume size. Takes precedence over AvailableCapacity for filtering.
+		// See https://github.com/kubernetes/kubernetes/commit/3fa43540b6eace70951c7867d60fda741b9bca05
+		MaximumVolumeSize: &wrapperspb.Int64Value{Value: maximumVolumeSize},
+		// Used by kube-scheduler to score nodes by total remaining capacity.
+		// Alpha as of v1.35; requires the StorageCapacityScoring feature flag.
+		// See KEP-4049 (Storage Capacity Scoring of Nodes for Dynamic Provisioning).
+		AvailableCapacity: availableCapacity,
+	}
+
+	return rsp, nil
+}
+
+func (cs *ControllerServer) getSettingAsBoolean(ctx context.Context, name types.SettingName) (bool, error) {
+	obj, err := cs.lhClient.LonghornV1beta2().Settings(cs.lhNamespace).Get(ctx, string(name), metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	return strconv.ParseBool(obj.Value)
+}
+
+func (cs *ControllerServer) getSettingAsInt(ctx context.Context, name types.SettingName) (int64, error) {
+	obj, err := cs.lhClient.LonghornV1beta2().Settings(cs.lhNamespace).Get(ctx, string(name), metav1.GetOptions{})
+	if err != nil {
+		return -1, err
+	}
+	return strconv.ParseInt(obj.Value, 10, 64)
+}
+
+func (cs *ControllerServer) getSettingAsString(ctx context.Context, name types.SettingName) (string, error) {
+	obj, err := cs.lhClient.LonghornV1beta2().Settings(cs.lhNamespace).Get(ctx, string(name), metav1.GetOptions{})
+	if err != nil {
+		return "", err
+	}
+	return obj.Value, nil
+}
+
+func (cs *ControllerServer) CreateSnapshot(ctx context.Context, req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "CreateSnapshot"})
+
+	logCSIRequest(log, "CreateSnapshot", req)
+
+	var rsp *csi.CreateSnapshotResponse
+	var err error
+	defer func() {
+		if err != nil {
+			log.WithError(err).Errorf("Failed to create snapshot")
+		}
+	}()
+
+	csiSnapshotType := normalizeCSISnapshotType(req.Parameters["type"])
+	switch csiSnapshotType {
+	case csiSnapshotTypeLonghornSnapshot:
+		rsp, err = cs.createCSISnapshotTypeLonghornSnapshot(req)
+	case csiSnapshotTypeLonghornBackingImage:
+		rsp, err = cs.createCSISnapshotTypeLonghornBackingImage(req)
+	case "", csiSnapshotTypeLonghornBackup:
+		// For backward compatibility, empty type is considered as csiSnapshotTypeLonghornBackup
+		rsp, err = cs.createCSISnapshotTypeLonghornBackup(req)
+	default:
+		return nil, status.Errorf(codes.InvalidArgument, "invalid CSI snapshot type: %v. Must be %v or %v or \"\"", csiSnapshotType, csiSnapshotTypeLonghornSnapshot, csiSnapshotTypeLonghornBackup)
+	}
+
+	return rsp, err
+}
+
+func (cs *ControllerServer) createCSISnapshotTypeLonghornBackingImage(req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "createCSISnapshotTypeLonghornBackingImage"})
+
+	csiSnapshotName := req.GetName()
+	csiVolumeName := req.GetSourceVolumeId()
+	if len(csiVolumeName) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume name must be provided")
+	} else if len(csiSnapshotName) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Snapshot name must be provided")
+	}
+
+	vol, err := cs.apiClient.Volume.ById(csiVolumeName)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if vol == nil {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", csiVolumeName)
+	}
+
+	var backingImage *longhornclient.BackingImage
+	backingImageListOutput, err := cs.apiClient.BackingImage.List(&longhornclient.ListOpts{})
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	for _, bi := range backingImageListOutput.Data {
+		if bi.Name == csiSnapshotName {
+			backingImage = &bi
+			break
+		}
+	}
+
+	exportType, exist := req.Parameters["exportType"]
+	if !exist {
+		exportType, exist = req.Parameters["export-type"]
+		if !exist {
+			exportType = "raw"
+		}
+	}
+
+	if backingImage == nil {
+		biParameters := map[string]string{
+			longhorn.DataSourceTypeExportParameterVolumeName: csiVolumeName,
+			longhorn.DataSourceTypeExportParameterExportType: exportType,
+		}
+
+		backingImage = &longhornclient.BackingImage{
+			Name:       csiSnapshotName,
+			SourceType: string(longhorn.BackingImageDataSourceTypeExportFromVolume),
+			Parameters: biParameters,
+		}
+
+		if diskSelector, ok := req.Parameters["diskSelector"]; ok {
+			backingImage.DiskSelector = strings.Split(diskSelector, ",")
+		}
+
+		if nodeSelector, ok := req.Parameters["nodeSelector"]; ok {
+			backingImage.NodeSelector = strings.Split(nodeSelector, ",")
+		}
+
+		log.Infof("Creating backing image type snapshot %v exported from volume %s", csiSnapshotName, vol.Name)
+		backingImage, err = cs.apiClient.BackingImage.Create(backingImage)
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+	snapshotID := encodeSnapshotBackingImageID(backingImage.Name, exportType, vol.Name)
+	return createSnapshotResponseForSnapshotTypeLonghornBackingImage(vol.Name, snapshotID, time.Now().UTC().Format(time.RFC3339), vol.Size, true), nil
+}
+
+func (cs *ControllerServer) createCSISnapshotTypeLonghornSnapshot(req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "createCSISnapshotTypeLonghornSnapshot"})
+
+	csiLabels := req.Parameters
+	csiSnapshotName := req.GetName()
+	csiVolumeName := req.GetSourceVolumeId()
+	if len(csiVolumeName) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume name must be provided")
+	} else if len(csiSnapshotName) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Snapshot name must be provided")
+	}
+
+	vol, err := cs.apiClient.Volume.ById(csiVolumeName)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if vol == nil {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", csiVolumeName)
+	}
+
+	var snapshotCR *longhornclient.SnapshotCR
+	snapshotCRs, err := cs.apiClient.Volume.ActionSnapshotCRList(vol)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	for _, snapCR := range snapshotCRs.Data {
+		if snapCR.Name == csiSnapshotName {
+			snapshotCR = &snapCR
+			break
+		}
+	}
+
+	if snapshotCR == nil {
+		log.Infof("Creating volume %s snapshot %s", vol.Name, csiSnapshotName)
+		snapshotCR, err = cs.apiClient.Volume.ActionSnapshotCRCreate(vol, &longhornclient.SnapshotCRInput{
+			Labels: csiLabels,
+			Name:   csiSnapshotName,
+		})
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+
+	// wait for the snapshot creation to be fully finished
+	snapshotCR, err = cs.waitForSnapshotToBeReady(snapshotCR.Name, vol.Name)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	snapshotID := encodeSnapshotID(csiSnapshotTypeLonghornSnapshot, vol.Name, snapshotCR.Name)
+	return createSnapshotResponseForSnapshotTypeLonghornSnapshot(vol.Name, snapshotID, snapshotCR), nil
+}
+
+func (cs *ControllerServer) createCSISnapshotTypeLonghornBackup(req *csi.CreateSnapshotRequest) (*csi.CreateSnapshotResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "createCSISnapshotTypeLonghornBackup"})
+
+	csiLabels := req.Parameters
+	csiSnapshotName := req.GetName()
+	csiVolumeName := req.GetSourceVolumeId()
+	if len(csiVolumeName) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Volume name must be provided")
+	} else if len(csiSnapshotName) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "Snapshot name must be provided")
+	}
+
+	backupMode, exist := req.Parameters["backupMode"]
+	if !exist {
+		backupMode = string(longhorn.BackupModeIncremental)
+	}
+
+	// We check for backup existence first, since it's possible that the actual volume is no longer available but the
+	// backup still is.
+	backup, err := cs.getBackup(csiVolumeName, csiSnapshotName)
+	if err != nil {
+		// Status code set in waitForBackupControllerSync.
+		return nil, err
+	}
+
+	if backup != nil {
+		// Per the CSI spec, if we are unable to complete the CreateSnapshot call successfully, we must return a non-ok
+		// gRPC code. In practice, doing so ensures we get requeued (and quickly deleted) when we hit
+		// https://github.com/kubernetes-csi/external-snapshotter/issues/880.
+		if backup.Error != "" {
+			return nil, status.Error(codes.Internal, backup.Error)
+		}
+
+		snapshotID := encodeSnapshotID(csiSnapshotTypeLonghornBackup, backup.VolumeName, backup.Name)
+		rsp := createSnapshotResponseForSnapshotTypeLonghornBackup(backup.VolumeName, snapshotID,
+			backup.SnapshotCreated, backup.VolumeSize, backup.State == string(longhorn.BackupStateCompleted))
+		return rsp, nil
+	}
+
+	existVol, err := cs.apiClient.Volume.ById(csiVolumeName)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if existVol == nil {
+		return nil, status.Errorf(codes.NotFound, "volume %s not found", csiVolumeName)
+	}
+
+	existBackupTarget, err := cs.apiClient.BackupTarget.ById(existVol.BackupTargetName)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if existBackupTarget == nil {
+		return nil, status.Errorf(codes.NotFound, "backup target %s not found", existVol.BackupTargetName)
+	}
+	if isBackupTargetUnavailableForBackup(existBackupTarget) {
+		return nil, status.Errorf(codes.Aborted, "backup target %s is not available", existVol.BackupTargetName)
+	}
+
+	var snapshotCR *longhornclient.SnapshotCR
+	snapshotCRs, err := cs.apiClient.Volume.ActionSnapshotCRList(existVol)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	for _, snap := range snapshotCRs.Data {
+		if snap.Name == csiSnapshotName {
+			snapshotCR = &snap
+			break
+		}
+	}
+
+	// no existing backup and no local snapshot, create a new one
+	if snapshotCR == nil {
+		log.Infof("Creating Volume %s snapshot %s", existVol.Name, csiSnapshotName)
+		snapshotCR, err = cs.apiClient.Volume.ActionSnapshotCRCreate(existVol, &longhornclient.SnapshotCRInput{
+			Labels: csiLabels,
+			Name:   csiSnapshotName,
+		})
+		// failed to create snapshot, so there is no way to backup
+		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+
+	// wait for the snapshot creation to be fully finished
+	snapshotCR, err = cs.waitForSnapshotToBeReady(snapshotCR.Name, existVol.Name)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	// create backup based on local volume snapshot
+	log.Infof("Creating volume %s backup for snapshot %s", existVol.Name, csiSnapshotName)
+	existVol, err = cs.apiClient.Volume.ActionSnapshotBackup(existVol, &longhornclient.SnapshotInput{
+		Labels:     csiLabels,
+		Name:       csiSnapshotName,
+		BackupMode: backupMode,
+	})
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	// Get the newly created backup. Don't wait for the backup controller to actually start the backup and update the
+	// status. It's possible that the backup operation can't actually be completed, but we need to return quickly so the
+	// CO can unfreeze I/O (if freezing is supported) and without error (if possible) so the CO knows our ID and can use
+	// it in future calls.
+	backup, err = cs.waitForBackupControllerSync(existVol.Name, csiSnapshotName)
+	if err != nil {
+		// Status code set in waitForBackupControllerSync.
+		return nil, err
+	}
+
+	log.Infof("Volume %s backup %s of snapshot %s created", backup.VolumeName, backup.Name, csiSnapshotName)
+	snapshotID := encodeSnapshotID(csiSnapshotTypeLonghornBackup, backup.VolumeName, backup.Name)
+	rsp := createSnapshotResponseForSnapshotTypeLonghornBackup(backup.VolumeName, snapshotID, snapshotCR.CreationTime,
+		existVol.Size, backup.State == string(longhorn.BackupStateCompleted))
+	return rsp, nil
+}
+
+func isBackupTargetUnavailableForBackup(backupTarget *longhornclient.BackupTarget) bool {
+	return backupTarget == nil || backupTarget.BackupTargetURL == "" || !backupTarget.Available
+}
+
+func createSnapshotResponseForSnapshotTypeLonghornSnapshot(sourceVolumeName, snapshotID string, snapshotCR *longhornclient.SnapshotCR) *csi.CreateSnapshotResponse {
+	creationTime, err := toProtoTimestamp(snapshotCR.CreationTime)
+	if err != nil {
+		logrus.WithError(err).Errorf("Failed to parse creation time %v for csi snapshot %v", snapshotCR.CreationTime, snapshotID)
+	}
+
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SizeBytes:      snapshotCR.RestoreSize,
+			SnapshotId:     snapshotID,
+			SourceVolumeId: sourceVolumeName,
+			CreationTime:   creationTime,
+			ReadyToUse:     snapshotCR.ReadyToUse,
+		},
+	}
+}
+
+func createSnapshotResponseForSnapshotTypeLonghornBackup(sourceVolumeName, snapshotID, snapshotTime, sourceVolumeSize string, readyToUse bool) *csi.CreateSnapshotResponse {
+	creationTime, err := toProtoTimestamp(snapshotTime)
+	if err != nil {
+		logrus.WithError(err).Errorf("Failed to parse creation time %v for CSI snapshot %v", snapshotTime, snapshotID)
+	}
+
+	size, _ := util.ConvertSize(sourceVolumeSize)
+	size = util.RoundUpSize(size)
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SizeBytes:      size,
+			SnapshotId:     snapshotID,
+			SourceVolumeId: sourceVolumeName,
+			CreationTime:   creationTime,
+			ReadyToUse:     readyToUse,
+		},
+	}
+}
+
+func createSnapshotResponseForSnapshotTypeLonghornBackingImage(sourceVolumeName, snapshotID, snapshotTime, sourceVolumeSize string, readyToUse bool) *csi.CreateSnapshotResponse {
+	creationTime, err := toProtoTimestamp(snapshotTime)
+	if err != nil {
+		logrus.WithError(err).Errorf("Failed to parse creation time %v for CSI snapshot %v", snapshotTime, snapshotID)
+	}
+
+	size, _ := util.ConvertSize(sourceVolumeSize)
+	size = util.RoundUpSize(size)
+	return &csi.CreateSnapshotResponse{
+		Snapshot: &csi.Snapshot{
+			SizeBytes:      size,
+			SnapshotId:     snapshotID,
+			SourceVolumeId: sourceVolumeName,
+			CreationTime:   creationTime,
+			ReadyToUse:     readyToUse,
+		},
+	}
+}
+
+func encodeSnapshotID(csiSnapshotType, sourceVolumeName, id string) string {
+	csiSnapshotType = normalizeCSISnapshotType(csiSnapshotType)
+	if csiSnapshotType == csiSnapshotTypeLonghornSnapshot || csiSnapshotType == csiSnapshotTypeLonghornBackup {
+		return fmt.Sprintf("%s://%s/%s", csiSnapshotType, sourceVolumeName, id)
+	}
+	// If the csiSnapshotType is invalid, pass through the id
+	return id
+}
+
+func decodeSnapshotID(snapshotID string) (csiSnapshotType, sourceVolumeName, id string) {
+	split := strings.Split(snapshotID, "://")
+	if len(split) < 2 {
+		return "", "", ""
+	}
+	csiSnapshotType = split[0]
+	if normalizeCSISnapshotType(csiSnapshotType) == csiSnapshotTypeLonghornBackingImage {
+		return csiSnapshotTypeLonghornBackingImage, "", ""
+	}
+
+	split = strings.Split(split[1], "/")
+	if len(split) < 2 {
+		return "", "", ""
+	}
+	sourceVolumeName = split[0]
+	id = split[1]
+	return normalizeCSISnapshotType(csiSnapshotType), sourceVolumeName, id
+}
+
+func encodeSnapshotBackingImageID(id, exportType, volumeName string) string {
+	return fmt.Sprintf("bi://backing?%v=%v&%v=%v&%v=%v&%v=%v",
+		longhorn.BackingImageParameterName, id,
+		longhorn.BackingImageParameterDataSourceType, longhorn.BackingImageDataSourceTypeExportFromVolume,
+		longhorn.DataSourceTypeExportParameterExportType, exportType,
+		longhorn.DataSourceTypeExportParameterVolumeName, volumeName,
+	)
+}
+
+func decodeSnapshoBackingImageID(snapshotID string) (parameters map[string]string) {
+	parameters = make(map[string]string)
+	u, err := url.Parse(snapshotID)
+	if err != nil {
+		return
+	}
+	queries := u.Query()
+	for key, value := range queries {
+		parameters[key] = value[0]
+	}
+	return
+}
+
+// normalizeCSISnapshotType converts the deprecated CSISnapshotType to the its new value
+func normalizeCSISnapshotType(cSISnapshotType string) string {
+	if cSISnapshotType == deprecatedCSISnapshotTypeLonghornBackup {
+		return csiSnapshotTypeLonghornBackup
+	}
+	return cSISnapshotType
+}
+
+func (cs *ControllerServer) DeleteSnapshot(ctx context.Context, req *csi.DeleteSnapshotRequest) (*csi.DeleteSnapshotResponse, error) {
+	snapshotID := req.GetSnapshotId()
+	if len(snapshotID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "missing snapshot id in request")
+	}
+
+	csiSnapshotType, sourceVolumeName, id := decodeSnapshotID(snapshotID)
+	switch csiSnapshotType {
+	case csiSnapshotTypeLonghornBackingImage:
+		if err := cs.cleanupBackingImage(snapshotID); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	case csiSnapshotTypeLonghornSnapshot:
+		if id == "" {
+			return nil, status.Errorf(codes.NotFound, "volume source snapshot %v is not found", snapshotID)
+		}
+		if err := cs.cleanupSnapshot(sourceVolumeName, id); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	case csiSnapshotTypeLonghornBackup:
+		if id == "" {
+			return nil, status.Errorf(codes.NotFound, "volume source snapshot %v is not found", snapshotID)
+		}
+		if err := cs.cleanupBackup(sourceVolumeName, id); err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+	}
+
+	return &csi.DeleteSnapshotResponse{}, nil
+}
+
+func (cs *ControllerServer) cleanupBackingImage(snapshotID string) error {
+	backingImageParameters := decodeSnapshoBackingImageID(snapshotID)
+	backingImage, err := cs.apiClient.BackingImage.ById(backingImageParameters[longhorn.BackingImageParameterName])
+	if err != nil {
+		return err
+	}
+	if backingImage != nil {
+		if err := cs.apiClient.BackingImage.Delete(backingImage); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cs *ControllerServer) cleanupSnapshot(sourceVolumeName, id string) error {
+	volume, err := cs.apiClient.Volume.ById(sourceVolumeName)
+	if err != nil {
+		return err
+	}
+	if volume != nil {
+		if _, err := cs.apiClient.Volume.ActionSnapshotCRDelete(volume, &longhornclient.SnapshotCRInput{
+			Name: id,
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (cs *ControllerServer) cleanupBackup(sourceVolumeName, id string) error {
+	backupVolumeName, backupName := sourceVolumeName, id
+	backupVolumes, err := cs.getBackupVolumes(backupVolumeName)
+	if err != nil {
+		return err
+	}
+	for _, bv := range backupVolumes {
+		// The BackupDelete API actually doesn't care about bv when deleting a backup.
+		// The bv is there for backward compatibility.
+		// Any bv will work
+		if bv.Name != "" {
+			_, err = cs.apiClient.BackupVolume.ActionBackupDelete(bv, &longhornclient.BackupInput{
+				Name: backupName,
+			})
+			if err != nil {
+				return err
+			}
+			return nil
+		}
+	}
+
+	return nil
+}
+
+func (cs *ControllerServer) ListSnapshots(context.Context, *csi.ListSnapshotsRequest) (*csi.ListSnapshotsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "")
+}
+
+func (cs *ControllerServer) ControllerExpandVolume(ctx context.Context, req *csi.ControllerExpandVolumeRequest) (*csi.ControllerExpandVolumeResponse, error) {
+	log := cs.log.WithFields(logrus.Fields{"function": "ControllerExpandVolume"})
+
+	logCSIRequest(log, "ControllerExpandVolume", req)
+
+	volumeID := req.GetVolumeId()
+	if len(volumeID) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "volume id missing in request")
+	}
+
+	if req.CapacityRange == nil {
+		return nil, status.Error(codes.InvalidArgument, "capacity range missing in request")
+	}
+	requestedSize := req.CapacityRange.GetRequiredBytes()
+
+	existVol, err := cs.apiClient.Volume.ById(volumeID)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+	if existVol == nil {
+		return nil, status.Errorf(codes.NotFound, "volume %s missing", volumeID)
+	}
+	if len(existVol.Controllers) != 1 {
+		return nil, status.Errorf(codes.InvalidArgument, "volume %s invalid controller count %v", volumeID, len(existVol.Controllers))
+	}
+	if existVol.State != string(longhorn.VolumeStateDetached) && existVol.State != string(longhorn.VolumeStateAttached) {
+		return nil, status.Errorf(codes.FailedPrecondition, "volume %s invalid state %v for controller volume expansion", volumeID, existVol.State)
+	}
+	existingSize, err := strconv.ParseInt(existVol.Size, 10, 64)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+
+	isOnlineExpansion := existVol.State == string(longhorn.VolumeStateAttached)
+
+	if existVol, err = cs.apiClient.Volume.ActionExpand(existVol, &longhornclient.ExpandInput{
+		Size: strconv.FormatInt(requestedSize, 10),
+	}); err != nil {
+		// TODO: This manual error code parsing should be refactored once Longhorn API implements error code response
+		// https://github.com/longhorn/longhorn/issues/1875
+		if matched, _ := regexp.MatchString("failed to schedule .* more bytes to disk", err.Error()); matched {
+			return nil, status.Errorf(codes.OutOfRange, "%v", err)
+		}
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+
+	// kubernetes doesn't support volume shrinking and the csi spec specifies to return true
+	// in the case where the current capacity is bigger or equal to the requested capacity
+	// that's why we return the volumeSize below instead of the requested capacity
+	volumeExpansionComplete := func(vol *longhornclient.Volume) bool {
+		engineReady := false
+		if len(vol.Controllers) > 0 {
+			engine := vol.Controllers[0]
+			engineSize, _ := strconv.ParseInt(engine.Size, 10, 64)
+			engineReady = engineSize >= requestedSize && !engine.IsExpanding
+		}
+		size, _ := strconv.ParseInt(vol.Size, 10, 64)
+		return size >= requestedSize && engineReady
+	}
+
+	// we wait for completion of the expansion, to ensure that longhorn and kubernetes state are in sync
+	// should this time out kubernetes will retry the expansion call since the call is idempotent
+	// we will exit early if the volume already has the requested size
+	if !cs.waitForVolumeState(volumeID, "volume expansion", volumeExpansionComplete, false, false) {
+		return nil, status.Errorf(codes.DeadlineExceeded, "volume %s expansion from existing capacity %v to requested capacity %v failed",
+			volumeID, existingSize, requestedSize)
+	}
+
+	volumeSize, err := strconv.ParseInt(existVol.Size, 10, 64)
+	if err != nil {
+		return nil, status.Errorf(codes.Internal, "%v", err)
+	}
+
+	if !isOnlineExpansion {
+		log.Info("Skip NodeExpandVolume since this is offline expansion, the filesystem resize will be handled by NodeStageVolume when there is a workload using the volume.")
+	}
+
+	return &csi.ControllerExpandVolumeResponse{
+		CapacityBytes:         volumeSize,
+		NodeExpansionRequired: isOnlineExpansion,
+	}, nil
+}
+
+func (cs *ControllerServer) ControllerGetVolume(context.Context, *csi.ControllerGetVolumeRequest) (*csi.ControllerGetVolumeResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "")
+}
+
+// isVolumeAvailableOn checks that the volume is attached and that an engine is running on the requested node
+func isVolumeAvailableOn(vol *longhornclient.Volume, node string) bool {
+	return vol.State == string(longhorn.VolumeStateAttached) && isEngineOnNodeAvailable(vol, node)
+}
+
+func isEngineOnNodeAvailable(vol *longhornclient.Volume, node string) bool {
+	for _, controller := range vol.Controllers {
+		if controller.HostId == node && controller.Endpoint != "" {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isVolumeShareAvailable(vol *longhornclient.Volume) bool {
+	return vol.AccessMode == string(longhorn.AccessModeReadWriteMany) &&
+		vol.ShareState == string(longhorn.ShareManagerStateRunning) && vol.ShareEndpoint != ""
+}
+
+func (cs *ControllerServer) waitForVolumeState(volumeID string, stateDescription string,
+	predicate func(vol *longhornclient.Volume) bool, notFoundRetry, notFoundReturn bool) bool {
+	log := cs.log.WithFields(logrus.Fields{"function": "waitForVolumeState"})
+	timer := time.NewTimer(timeoutAttachDetach)
+	defer timer.Stop()
+	timeout := timer.C
+
+	ticker := time.NewTicker(tickAttachDetach)
+	defer ticker.Stop()
+	tick := ticker.C
+
+	for {
+		select {
+		case <-timeout:
+			log.Warnf("Timeout while waiting for volume %s state %s", volumeID, stateDescription)
+			return false
+		case <-tick:
+			existVol, err := cs.apiClient.Volume.ById(volumeID)
+			if err != nil {
+				log.WithError(err).Warnf("Failed to get volume while waiting for volume %s state %s", volumeID, stateDescription)
+				continue
+			}
+			if existVol == nil {
+				log.Warnf("Volume %s does not exist", volumeID)
+				if notFoundRetry {
+					continue
+				}
+				return notFoundReturn
+			}
+			if predicate(existVol) {
+				return true
+			}
+		}
+	}
+}
+
+// waitForBackupControllerSync polls until the backup controller has synced the snapshot creation time into the Backup
+// CR (best effort). On timeout, if the Backup CR exists it is returned so the caller can respond with
+// ready_to_use=false per the CSI spec; if the CR does not exist at all a codes.Internal error is returned.
+func (cs *ControllerServer) waitForBackupControllerSync(volumeName, snapshotName string) (*longhornclient.Backup, error) {
+	backup, err := cs.getBackup(volumeName, snapshotName)
+	if err != nil {
+		return nil, err
+	}
+	if backup != nil && backup.SnapshotCreated != "" {
+		return backup, nil
+	}
+
+	timer := time.NewTimer(timeoutBackupControllerSync)
+	defer timer.Stop()
+	timeout := timer.C
+
+	ticker := time.NewTicker(tickBackupControllerSync)
+	defer ticker.Stop()
+	tick := ticker.C
+
+	for {
+		select {
+		case <-timeout:
+			// Best effort: SnapshotCreated was not synced in time. If the Backup CR exists, return it so
+			// the caller can respond with ready_to_use=false per the CSI spec. The sidecar will retry
+			// CreateSnapshot idempotently until the backup completes and ready_to_use=true is returned.
+			backup, err := cs.getBackup(volumeName, snapshotName)
+			if err != nil {
+				return nil, err
+			}
+			if backup != nil {
+				logrus.Debugf("waitForBackupControllerSync: backup CR for snapshot %s on volume %s exists but SnapshotCreated not yet synced; returning with ready_to_use=false", snapshotName, volumeName)
+				return backup, nil
+			}
+			msg := fmt.Sprintf("waitForBackupControllerSync: timeout waiting for Backup CR to be created for volume %s snapshot %s", volumeName, snapshotName)
+			logrus.Warn(msg)
+			return nil, status.Error(codes.Internal, msg)
+		case <-tick:
+			backup, err := cs.getBackup(volumeName, snapshotName)
+			if err != nil {
+				return nil, err
+			}
+			if backup != nil && backup.SnapshotCreated != "" {
+				return backup, nil
+			}
+		}
+	}
+}
+
+// getBackup looks for all backups associated with the given backupVolume or volume and returns the one for the given
+// snapshot. It does not rely on volume.BackupStatus because volume.BackupStatus.Snapshot is only set if the backup
+// successfully initializes and after the backup monitor has had a chance to sync. We want to retrieve the backup
+// (and in particular, its name) as quickly as possible and in any state.
+// Note: if the backup doesn't exist it will return nil for the backup and nil for the error
+func (cs *ControllerServer) getBackup(volumeName, snapshotName string) (*longhornclient.Backup, error) {
+	backupTargetName := ""
+	v, err := cs.apiClient.Volume.ById(volumeName)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	if v != nil {
+		backupTargetName = v.BackupTargetName
+	}
+
+	bv, err := cs.apiClient.BackupVolume.ById(volumeName)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	var backup *longhornclient.Backup
+	backupListOutput, err := cs.apiClient.BackupVolume.ActionBackupListByVolume(bv, &longhornclient.Volume{Name: volumeName})
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+	for _, b := range backupListOutput.Data {
+		if b.SnapshotName == snapshotName {
+			if backupTargetName != "" && b.BackupTargetName != backupTargetName {
+				continue
+			}
+			backup = &b
+			return backup, nil
+		}
+	}
+
+	return nil, nil
+}
+
+func (cs *ControllerServer) validateVolumeCapabilities(volumeCaps []*csi.VolumeCapability) error {
+	if volumeCaps == nil {
+		return status.Error(codes.InvalidArgument, "Volume Capabilities cannot be empty")
+	}
+
+	for _, cap := range volumeCaps {
+		if cap.GetMount() == nil && cap.GetBlock() == nil {
+			return status.Error(codes.InvalidArgument, "failed to have both mount and block access type be undefined")
+		}
+		if cap.GetMount() != nil && cap.GetBlock() != nil {
+			return status.Error(codes.InvalidArgument, "failed to have both block and mount access type")
+		}
+
+		supportedMode := false
+		for _, m := range cs.accessModes {
+			if cap.GetAccessMode().GetMode() == m.GetMode() {
+				supportedMode = true
+				break
+			}
+		}
+		if !supportedMode {
+			return status.Errorf(codes.InvalidArgument, "access mode %v is not supported", cap.GetAccessMode().Mode.String())
+		}
+	}
+
+	return nil
+}
+
+func getControllerServiceCapabilities(cl []csi.ControllerServiceCapability_RPC_Type) []*csi.ControllerServiceCapability {
+	var cscs []*csi.ControllerServiceCapability
+
+	for _, cap := range cl {
+		logrus.Infof("Enabling controller service capability: %v", cap.String())
+		cscs = append(cscs, &csi.ControllerServiceCapability{
+			Type: &csi.ControllerServiceCapability_Rpc{
+				Rpc: &csi.ControllerServiceCapability_RPC{
+					Type: cap,
+				},
+			},
+		})
+	}
+
+	return cscs
+}
+
+func getVolumeCapabilityAccessModes(vc []csi.VolumeCapability_AccessMode_Mode) []*csi.VolumeCapability_AccessMode {
+	var vca []*csi.VolumeCapability_AccessMode
+	for _, c := range vc {
+		logrus.Infof("Enabling volume access mode: %v", c.String())
+		vca = append(vca, &csi.VolumeCapability_AccessMode{Mode: c})
+	}
+	return vca
+}
+
+func toProtoTimestamp(s string) (*timestamppb.Timestamp, error) {
+	t, err := util.ParseTimeZ(s)
+	if err != nil {
+		return nil, err
+	}
+
+	return timestamppb.New(t), nil
+}
+
+func (cs *ControllerServer) waitForSnapshotToBeReady(snapshotName, volumeName string) (*longhornclient.SnapshotCR, error) {
+	timer := time.NewTimer(timeoutSnapshotCreation)
+	defer timer.Stop()
+	timeout := timer.C
+
+	ticker := time.NewTicker(tickSnapshotCreation)
+	defer ticker.Stop()
+	tick := ticker.C
+
+	var existSnapshotCR *longhornclient.SnapshotCR
+	for {
+		select {
+		case <-timeout:
+			if existSnapshotCR != nil && existSnapshotCR.Error != "" {
+				return nil, fmt.Errorf("waitForSnapshotToBeReady: timeout while waiting for snapshot %v to be ready: %v", snapshotName, existSnapshotCR.Error)
+			}
+			return nil, fmt.Errorf("waitForSnapshotToBeReady: timeout while waiting for snapshot %v to be ready", snapshotName)
+		case <-tick:
+			vol, err := cs.apiClient.Volume.ById(volumeName)
+			if err != nil {
+				return nil, fmt.Errorf("waitForSnapshotToBeReady: fail to get source volume %v: %v", volumeName, err)
+			}
+			if vol == nil {
+				return nil, fmt.Errorf("waitForSnapshotToBeReady: volume %s not found", volumeName)
+			}
+			existSnapshotCR, err = cs.apiClient.Volume.ActionSnapshotCRGet(vol, &longhornclient.SnapshotCRInput{
+				Name: snapshotName,
+			})
+			if err != nil {
+				return nil, fmt.Errorf("waitForSnapshotToBeReady: error while waiting for snapshot %v to be ready: %v", snapshotName, err)
+			}
+			if existSnapshotCR.ReadyToUse {
+				return existSnapshotCR, nil
+			}
+		}
+	}
+}
+
+func (cs *ControllerServer) ControllerModifyVolume(ctx context.Context, req *csi.ControllerModifyVolumeRequest) (*csi.ControllerModifyVolumeResponse, error) {
+	logCSIRequest(cs.log, "ControllerModifyVolume", req)
+
+	return nil, status.Error(codes.Unimplemented, "")
+}
+
+// getAccessibleTopologyFromRequirements converts AccessibilityRequirements from CreateVolumeRequest
+// to AccessibleTopology for CreateVolumeResponse. This enables PV nodeAffinity to be set
+// based on StorageClass allowedTopologies.
+// According to CSI spec, Preferred topology takes precedence over Requisite topology.
+// The result is filtered by the CSI Allowed Topology Keys setting: only keys listed in the setting
+// are kept in topology segments. If the setting is empty, all topology keys are filtered out.
+func (cs *ControllerServer) getAccessibleTopologyFromRequirements(ctx context.Context, accessibilityReqs *csi.TopologyRequirement, strictTopology bool) []*csi.Topology {
+	if accessibilityReqs == nil {
+		return nil
+	}
+
+	log := cs.log.WithFields(logrus.Fields{"function": "getAccessibleTopologyFromRequirements"})
+
+	var accessibleTopology []*csi.Topology
+
+	// Preferred topology takes precedence according to CSI spec.
+	// With delayed binding, the first element of Preferred is the selected node's topology.
+	if len(accessibilityReqs.Preferred) > 0 {
+		accessibleTopology = accessibilityReqs.Preferred
+		log.Debugf("Using Preferred topology from AccessibilityRequirements: %+v", accessibleTopology)
+	} else if len(accessibilityReqs.Requisite) > 0 {
+		// If no Preferred topology, use Requisite topology
+		accessibleTopology = accessibilityReqs.Requisite
+		log.Debugf("Using Requisite topology from AccessibilityRequirements: %+v", accessibleTopology)
+	}
+
+	// When strictTopology is enabled, only use the first element (selected node topology)
+	// to pin PV nodeAffinity to the specific node's topology.
+	if strictTopology && len(accessibleTopology) > 0 {
+		log.Debugf("strictTopology enabled, pinning to first topology element: %+v", accessibleTopology[0])
+		accessibleTopology = accessibleTopology[:1]
+	}
+
+	// Filter topology keys based on the CSI Allowed Topology Keys setting.
+	// Only keys listed in the setting are kept; if the setting is empty or missing,
+	// all topology keys are filtered out (no nodeAffinity on PV).
+	allowedKeysStr, err := cs.getSettingAsString(ctx, types.SettingNameCSIAllowedTopologyKeys)
+	if err != nil {
+		log.WithError(err).Warn("Failed to get CSI allowed topology keys setting, filtering all topology keys")
+	}
+	allowedKeys := types.ParseCSIAllowedTopologyKeys(allowedKeysStr)
+
+	return cs.filterTopologyByAllowedKeys(accessibleTopology, allowedKeys)
+}
+
+// filterTopologyByAllowedKeys filters the segments of each topology entry,
+// keeping only the keys present in allowedKeys. If allowedKeys is empty,
+// nil is returned (no keys allowed means all topology is filtered out).
+// Topology entries whose segments become empty after filtering are dropped.
+func (cs *ControllerServer) filterTopologyByAllowedKeys(topologies []*csi.Topology, allowedKeys map[string]bool) []*csi.Topology {
+	if len(topologies) == 0 {
+		return topologies
+	}
+	if len(allowedKeys) == 0 {
+		return nil
+	}
+
+	log := cs.log.WithFields(logrus.Fields{"function": "filterTopologyByAllowedKeys"})
+
+	var filtered []*csi.Topology
+	seen := make(map[string]bool)
+	for _, topo := range topologies {
+		if topo == nil {
+			continue
+		}
+		newSegments := make(map[string]string)
+		for key, value := range topo.Segments {
+			if allowedKeys[key] {
+				newSegments[key] = value
+			}
+		}
+		if len(newSegments) == 0 {
+			log.Debugf("Topology entry dropped (no keys matched): original=%+v", topo.Segments)
+			continue
+		}
+		segKeyBytes, _ := json.Marshal(newSegments)
+		segKey := string(segKeyBytes)
+		if seen[segKey] {
+			log.Debugf("Topology entry dropped (duplicate): %+v", newSegments)
+			continue
+		}
+		seen[segKey] = true
+		filtered = append(filtered, &csi.Topology{Segments: newSegments})
+	}
+
+	log.Debugf("Filtered topology by allowed keys %v: %+v", allowedKeys, filtered)
+	return filtered
+}

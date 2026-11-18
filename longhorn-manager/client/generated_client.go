@@ -1,0 +1,197 @@
+package client
+
+type RancherClient struct {
+	RancherBaseClient
+
+	ApiVersion                                 ApiVersionOperations
+	Error                                      ErrorOperations
+	AttachInput                                AttachInputOperations
+	DetachInput                                DetachInputOperations
+	SnapshotInput                              SnapshotInputOperations
+	SnapshotCRInput                            SnapshotCRInputOperations
+	Backup                                     BackupOperations
+	BackupInput                                BackupInputOperations
+	BackupStatus                               BackupStatusOperations
+	SyncBackupResource                         SyncBackupResourceOperations
+	Orphan                                     OrphanOperations
+	RestoreStatus                              RestoreStatusOperations
+	PurgeStatus                                PurgeStatusOperations
+	RebuildStatus                              RebuildStatusOperations
+	ReplicaRemoveInput                         ReplicaRemoveInputOperations
+	SalvageInput                               SalvageInputOperations
+	ActivateInput                              ActivateInputOperations
+	ExpandInput                                ExpandInputOperations
+	EngineUpgradeInput                         EngineUpgradeInputOperations
+	Replica                                    ReplicaOperations
+	Controller                                 ControllerOperations
+	DiskUpdate                                 DiskUpdateOperations
+	UpdateReplicaCountInput                    UpdateReplicaCountInputOperations
+	UpdateReplicaAutoBalanceInput              UpdateReplicaAutoBalanceInputOperations
+	UpdateRebuildConcurrentSyncLimitInput      UpdateRebuildConcurrentSyncLimitInputOperations
+	UpdateDataLocalityInput                    UpdateDataLocalityInputOperations
+	UpdateAccessModeInput                      UpdateAccessModeInputOperations
+	UpdateSnapshotDataIntegrityInput           UpdateSnapshotDataIntegrityInputOperations
+	UpdateSnapshotMaxCountInput                UpdateSnapshotMaxCountInputOperations
+	UpdateSnapshotMaxSizeInput                 UpdateSnapshotMaxSizeInputOperations
+	UpdateReplicaRebuildingBandwidthLimitInput UpdateReplicaRebuildingBandwidthLimitInputOperations
+	UpdateUblkQueueDepthInput                  UpdateUblkQueueDepthInputOperations
+	UpdateUblkNumberOfQueueInput               UpdateUblkNumberOfQueueInputOperations
+	UpdateBackupCompressionInput               UpdateBackupCompressionInputOperations
+	UpdateUnmapMarkSnapChainRemovedInput       UpdateUnmapMarkSnapChainRemovedInputOperations
+	UpdateReplicaSoftAntiAffinityInput         UpdateReplicaSoftAntiAffinityInputOperations
+	UpdateReplicaZoneSoftAntiAffinityInput     UpdateReplicaZoneSoftAntiAffinityInputOperations
+	UpdateReplicaDiskSoftAntiAffinityInput     UpdateReplicaDiskSoftAntiAffinityInputOperations
+	UpdateFreezeFilesystemForSnapshotInput     UpdateFreezeFilesystemForSnapshotInputOperations
+	UpdateBackupTargetInput                    UpdateBackupTargetInputOperations
+	UpdateOfflineRebuildingInput               UpdateOfflineRebuildingInputOperations
+	WorkloadStatus                             WorkloadStatusOperations
+	CloneStatus                                CloneStatusOperations
+	Empty                                      EmptyOperations
+	VolumeRecurringJob                         VolumeRecurringJobOperations
+	VolumeRecurringJobInput                    VolumeRecurringJobInputOperations
+	PVCreateInput                              PVCreateInputOperations
+	PVCCreateInput                             PVCCreateInputOperations
+	SettingDefinition                          SettingDefinitionOperations
+	VolumeCondition                            VolumeConditionOperations
+	NodeCondition                              NodeConditionOperations
+	DiskCondition                              DiskConditionOperations
+	LonghornCondition                          LonghornConditionOperations
+	SupportBundle                              SupportBundleOperations
+	SupportBundleInitateInput                  SupportBundleInitateInputOperations
+	Tag                                        TagOperations
+	InstanceManager                            InstanceManagerOperations
+	BackingImageDiskFileStatus                 BackingImageDiskFileStatusOperations
+	BackingImageCleanupInput                   BackingImageCleanupInputOperations
+	UpdateMinNumberOfCopiesInput               UpdateMinNumberOfCopiesInputOperations
+	BackingImageRestoreInput                   BackingImageRestoreInputOperations
+	Attachment                                 AttachmentOperations
+	VolumeAttachment                           VolumeAttachmentOperations
+	Volume                                     VolumeOperations
+	Snapshot                                   SnapshotOperations
+	SnapshotCR                                 SnapshotCROperations
+	BackupTarget                               BackupTargetOperations
+	BackupVolume                               BackupVolumeOperations
+	BackupBackingImage                         BackupBackingImageOperations
+	Setting                                    SettingOperations
+	RecurringJob                               RecurringJobOperations
+	EngineImage                                EngineImageOperations
+	BackingImage                               BackingImageOperations
+	Node                                       NodeOperations
+	DiskUpdateInput                            DiskUpdateInputOperations
+	DiskInfo                                   DiskInfoOperations
+	KubernetesStatus                           KubernetesStatusOperations
+	BackupTargetListOutput                     BackupTargetListOutputOperations
+	BackupVolumeListOutput                     BackupVolumeListOutputOperations
+	BackupListOutput                           BackupListOutputOperations
+	SnapshotListOutput                         SnapshotListOutputOperations
+	SystemBackup                               SystemBackupOperations
+	SystemRestore                              SystemRestoreOperations
+	SnapshotCRListOutput                       SnapshotCRListOutputOperations
+}
+
+func constructClient(rancherBaseClient *RancherBaseClientImpl) *RancherClient {
+	client := &RancherClient{
+		RancherBaseClient: rancherBaseClient,
+	}
+
+	client.ApiVersion = newApiVersionClient(client)
+	client.Error = newErrorClient(client)
+	client.AttachInput = newAttachInputClient(client)
+	client.DetachInput = newDetachInputClient(client)
+	client.SnapshotInput = newSnapshotInputClient(client)
+	client.SnapshotCRInput = newSnapshotCRInputClient(client)
+	client.Backup = newBackupClient(client)
+	client.BackupInput = newBackupInputClient(client)
+	client.BackupStatus = newBackupStatusClient(client)
+	client.SyncBackupResource = newSyncBackupResourceClient(client)
+	client.Orphan = newOrphanClient(client)
+	client.RestoreStatus = newRestoreStatusClient(client)
+	client.PurgeStatus = newPurgeStatusClient(client)
+	client.RebuildStatus = newRebuildStatusClient(client)
+	client.ReplicaRemoveInput = newReplicaRemoveInputClient(client)
+	client.SalvageInput = newSalvageInputClient(client)
+	client.ActivateInput = newActivateInputClient(client)
+	client.ExpandInput = newExpandInputClient(client)
+	client.EngineUpgradeInput = newEngineUpgradeInputClient(client)
+	client.Replica = newReplicaClient(client)
+	client.Controller = newControllerClient(client)
+	client.DiskUpdate = newDiskUpdateClient(client)
+	client.UpdateReplicaCountInput = newUpdateReplicaCountInputClient(client)
+	client.UpdateReplicaAutoBalanceInput = newUpdateReplicaAutoBalanceInputClient(client)
+	client.UpdateRebuildConcurrentSyncLimitInput = newUpdateRebuildConcurrentSyncLimitInputClient(client)
+	client.UpdateDataLocalityInput = newUpdateDataLocalityInputClient(client)
+	client.UpdateAccessModeInput = newUpdateAccessModeInputClient(client)
+	client.UpdateSnapshotDataIntegrityInput = newUpdateSnapshotDataIntegrityInputClient(client)
+	client.UpdateSnapshotMaxCountInput = newUpdateSnapshotMaxCountInputClient(client)
+	client.UpdateSnapshotMaxSizeInput = newUpdateSnapshotMaxSizeInputClient(client)
+	client.UpdateReplicaRebuildingBandwidthLimitInput = newUpdateReplicaRebuildingBandwidthLimitInputClient(client)
+	client.UpdateUblkQueueDepthInput = newUpdateUblkQueueDepthInputClient(client)
+	client.UpdateUblkNumberOfQueueInput = newUpdateUblkNumberOfQueueInputClient(client)
+	client.UpdateBackupCompressionInput = newUpdateBackupCompressionInputClient(client)
+	client.UpdateUnmapMarkSnapChainRemovedInput = newUpdateUnmapMarkSnapChainRemovedInputClient(client)
+	client.UpdateReplicaSoftAntiAffinityInput = newUpdateReplicaSoftAntiAffinityInputClient(client)
+	client.UpdateReplicaZoneSoftAntiAffinityInput = newUpdateReplicaZoneSoftAntiAffinityInputClient(client)
+	client.UpdateReplicaDiskSoftAntiAffinityInput = newUpdateReplicaDiskSoftAntiAffinityInputClient(client)
+	client.UpdateFreezeFilesystemForSnapshotInput = newUpdateFreezeFilesystemForSnapshotInputClient(client)
+	client.UpdateBackupTargetInput = newUpdateBackupTargetInputClient(client)
+	client.UpdateOfflineRebuildingInput = newUpdateOfflineRebuildingInputClient(client)
+	client.WorkloadStatus = newWorkloadStatusClient(client)
+	client.CloneStatus = newCloneStatusClient(client)
+	client.Empty = newEmptyClient(client)
+	client.VolumeRecurringJob = newVolumeRecurringJobClient(client)
+	client.VolumeRecurringJobInput = newVolumeRecurringJobInputClient(client)
+	client.PVCreateInput = newPVCreateInputClient(client)
+	client.PVCCreateInput = newPVCCreateInputClient(client)
+	client.SettingDefinition = newSettingDefinitionClient(client)
+	client.VolumeCondition = newVolumeConditionClient(client)
+	client.NodeCondition = newNodeConditionClient(client)
+	client.DiskCondition = newDiskConditionClient(client)
+	client.LonghornCondition = newLonghornConditionClient(client)
+	client.SupportBundle = newSupportBundleClient(client)
+	client.SupportBundleInitateInput = newSupportBundleInitateInputClient(client)
+	client.Tag = newTagClient(client)
+	client.InstanceManager = newInstanceManagerClient(client)
+	client.BackingImageDiskFileStatus = newBackingImageDiskFileStatusClient(client)
+	client.BackingImageCleanupInput = newBackingImageCleanupInputClient(client)
+	client.UpdateMinNumberOfCopiesInput = newUpdateMinNumberOfCopiesInputClient(client)
+	client.BackingImageRestoreInput = newBackingImageRestoreInputClient(client)
+	client.Attachment = newAttachmentClient(client)
+	client.VolumeAttachment = newVolumeAttachmentClient(client)
+	client.Volume = newVolumeClient(client)
+	client.Snapshot = newSnapshotClient(client)
+	client.SnapshotCR = newSnapshotCRClient(client)
+	client.BackupTarget = newBackupTargetClient(client)
+	client.BackupVolume = newBackupVolumeClient(client)
+	client.BackupBackingImage = newBackupBackingImageClient(client)
+	client.Setting = newSettingClient(client)
+	client.RecurringJob = newRecurringJobClient(client)
+	client.EngineImage = newEngineImageClient(client)
+	client.BackingImage = newBackingImageClient(client)
+	client.Node = newNodeClient(client)
+	client.DiskUpdateInput = newDiskUpdateInputClient(client)
+	client.DiskInfo = newDiskInfoClient(client)
+	client.KubernetesStatus = newKubernetesStatusClient(client)
+	client.BackupTargetListOutput = newBackupTargetListOutputClient(client)
+	client.BackupVolumeListOutput = newBackupVolumeListOutputClient(client)
+	client.BackupListOutput = newBackupListOutputClient(client)
+	client.SnapshotListOutput = newSnapshotListOutputClient(client)
+	client.SystemBackup = newSystemBackupClient(client)
+	client.SystemRestore = newSystemRestoreClient(client)
+	client.SnapshotCRListOutput = newSnapshotCRListOutputClient(client)
+
+	return client
+}
+
+func NewRancherClient(opts *ClientOpts) (*RancherClient, error) {
+	rancherBaseClient := &RancherBaseClientImpl{
+		Types: map[string]Schema{},
+	}
+	client := constructClient(rancherBaseClient)
+
+	err := setupRancherBaseClient(rancherBaseClient, opts)
+	if err != nil {
+		return nil, err
+	}
+
+	return client, nil
+}

@@ -1,0 +1,89 @@
+package constant
+
+const (
+	EventReasonCreate            = "Create"
+	EventReasonFailedCreatingFmt = "FailedCreating: %v %v"
+	EventReasonCreated           = "Created"
+	EventReasonDelete            = "Delete"
+	EventReasonDeleting          = "Deleting"
+	EventReasonFailedDeleting    = "FailedDeleting"
+	EventReasonStart             = "Start"
+	EventReasonFailedStarting    = "FailedStarting"
+	EventReasonStop              = "Stop"
+	EventReasonFailedStopping    = "FailedStopping"
+	EventReasonUpdate            = "Update"
+
+	EventReasonRebuilt          = "Rebuilt"
+	EventReasonRebuilding       = "Rebuilding"
+	EventReasonFailedRebuilding = "FailedRebuilding"
+
+	EventReasonVolumeCloneCompleted                   = "VolumeCloneCompleted"
+	EventReasonVolumeCloneCopyCompleteAwaitingHealthy = "VolumeCloneCopyCompleteAwaitingHealthy"
+	EventReasonVolumeCloneInitiated                   = "VolumeCloneInitiated"
+	EventReasonVolumeCloneFailed                      = "VolumeCloneFailed"
+
+	EventReasonFailedStartingSnapshotPurge = "FailedStartingSnapshotPurge"
+	EventReasonTimeoutSnapshotPurge        = "TimeoutSnapshotPurge"
+	EventReasonFailedSnapshotPurge         = "FailedSnapshotPurge"
+
+	EventReasonRestored      = "Restored"
+	EventReasonRestoredFmt   = "Restored %v"
+	EventReasonFailedRestore = "FailedRestore"
+
+	EventReasonFailedFilesystemTrim = "FailedFilesystemTrim"
+
+	EventReasonFailedExpansion    = "FailedExpansion"
+	EventReasonSucceededExpansion = "SucceededExpansion"
+	EventReasonCanceledExpansion  = "CanceledExpansion"
+
+	EventReasonAttached = "Attached"
+	EventReasonDetached = "Detached"
+	EventReasonHealthy  = "Healthy"
+	EventReasonFaulted  = "Faulted"
+	EventReasonDegraded = "Degraded"
+	EventReasonOrphaned = "Orphaned"
+	EventReasonUnknown  = "Unknown"
+
+	EventReasonEvictionAutomatic     = "EvictionAutomatic"
+	EventReasonEvictionUserRequested = "EvictionUserRequested"
+	EventReasonEvictionCanceled      = "EvictionCanceled"
+	EventReasonEvictionFailed        = "EvictionFailed"
+
+	EventReasonDetachedUnexpectedly = "DetachedUnexpectedly"
+	EventReasonRemount              = "Remount"
+	EventReasonAutoSalvaged         = "AutoSalvaged"
+
+	EventReasonFetching = "Fetching"
+	EventReasonFetched  = "Fetched"
+
+	EventReasonSyncing = "Syncing"
+	EventReasonSynced  = "Synced"
+
+	EventReasonFailedSnapshotDataIntegrityCheck = "FailedSnapshotDataIntegrityCheck"
+
+	EventReasonFailed           = "Failed"
+	EventReasonReady            = "Ready"
+	EventReasonUploaded         = "Uploaded"
+	EventReasonSwitchover       = "Switchover"
+	EventReasonFailedSwitchover = "FailedSwitchover"
+
+	EventReasonUpgrade                = "Upgrade"
+	EventReasonFailedUpgradePreCheck  = "FailedUpgradePreCheck"
+	EventReasonFailedUpgradePostCheck = "FailedUpgradePostCheck"
+	EventReasonPassedUpgradeCheck     = "PassedUpgradeCheck"
+
+	EventReasonRolloutSkippedFmt = "RolloutSkipped: %v %v"
+
+	EventReasonMigrationFailed = "MigrationFailed"
+
+	EventReasonOrphanCleanupCompleted = "OrphanCleanupCompleted"
+
+	EventReasonStaleInstance = "StaleInstance"
+
+	EventReasonShardFailed = "ShardFailed"
+
+	// EventReasonDegradedReadEIO means a read was failed with EIO because the
+	// data could not be safely rebuilt from parity: a crash left some stripes
+	// unscrubbed and a disk failed before the startup scrub could repair them.
+	EventReasonDegradedReadEIO = "DegradedReadEIO"
+)

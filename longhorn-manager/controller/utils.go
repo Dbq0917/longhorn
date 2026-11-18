@@ -1,0 +1,355 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/cockroachdb/errors"
+	"github.com/sirupsen/logrus"
+
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/util/flowcontrol"
+	"k8s.io/client-go/util/workqueue"
+	"k8s.io/kubernetes/pkg/controller"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	lhtypes "github.com/longhorn/go-common-libs/types"
+
+	"github.com/longhorn/longhorn-manager/datastore"
+	"github.com/longhorn/longhorn-manager/types"
+
+	longhorn "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+)
+
+const (
+	podRecreateInitBackoff = 1 * time.Second
+	podRecreateMaxBackoff  = 120 * time.Second
+	backoffGCPeriod        = 12 * time.Hour
+
+	// Matches revisioned engine image tags such as 1.10.2-4.12 or 1.10.2-4.20.
+	engineImageRevisionTagPattern = `.+-\d+\.\d+$`
+)
+
+var (
+	engineImageRevisionTagRegex = regexp.MustCompile(engineImageRevisionTagPattern)
+)
+
+// newBackoff returns a flowcontrol.Backoff and starts a background GC loop.
+func newBackoff(ctx context.Context) *flowcontrol.Backoff {
+	backoff := flowcontrol.NewBackOff(podRecreateInitBackoff, podRecreateMaxBackoff)
+
+	go func() {
+		ticker := time.NewTicker(backoffGCPeriod)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				backoff.GC()
+			}
+		}
+	}()
+
+	return backoff
+}
+
+func hasReplicaEvictionRequested(rs map[string]*longhorn.Replica) bool {
+	for _, r := range rs {
+		if r.Spec.EvictionRequested {
+			return true
+		}
+	}
+
+	return false
+}
+
+func hasShardEvictionRequested(shards map[string]*longhorn.Shard) bool {
+	for _, s := range shards {
+		if s.Spec.EvictionRequested {
+			return true
+		}
+	}
+
+	return false
+}
+
+func isVolumeUpgrading(v *longhorn.Volume) bool {
+	return v.Status.CurrentImage != v.Spec.Image
+}
+
+func isEngineUpgrading(e *longhorn.Engine) bool {
+	return e.Status.CurrentImage != e.Spec.Image
+}
+
+// The flow is: VolumeCloneStateEmpty => VolumeCloneStateInitiated => VolumeCloneStateCopyCompletedAwaitingHealthy => VolumeCloneStateFailed or VolumeCloneStateCompleted
+// isCloneTargetCopyInProgress returns true if the volume is a clone target and has not reached copy-complete yet
+func isCloneTargetCopyInProgress(v *longhorn.Volume) bool {
+	isCloneTarget := types.IsDataFromVolume(v.Spec.DataSource)
+	reachedOrAfterCopyComplete := v.Status.CloneStatus.State == longhorn.VolumeCloneStateCopyCompletedAwaitingHealthy ||
+		v.Status.CloneStatus.State == longhorn.VolumeCloneStateFailed ||
+		v.Status.CloneStatus.State == longhorn.VolumeCloneStateCompleted
+	return isCloneTarget && !reachedOrAfterCopyComplete
+}
+
+// isCloneTargetActive returns true if the volume is a clone target and has not reached a terminal state
+func isCloneTargetActive(v *longhorn.Volume) bool {
+	isCloneTarget := types.IsDataFromVolume(v.Spec.DataSource)
+	isTerminal := v.Status.CloneStatus.State == longhorn.VolumeCloneStateFailed ||
+		v.Status.CloneStatus.State == longhorn.VolumeCloneStateCompleted ||
+		v.Status.CloneStatus.State == longhorn.VolumeCloneStateCopyCompletedAwaitingHealthy
+	return isCloneTarget && !isTerminal
+}
+
+// isCloneTargetNotCompletedAndNotCopyCompleted returns true if v is a clone target and not in copy-complete or completed state
+func isCloneTargetNotCompletedAndNotCopyCompleted(v *longhorn.Volume) bool {
+	isCloneTarget := types.IsDataFromVolume(v.Spec.DataSource)
+	completedOrCopyCompleted := v.Status.CloneStatus.State == longhorn.VolumeCloneStateCopyCompletedAwaitingHealthy ||
+		v.Status.CloneStatus.State == longhorn.VolumeCloneStateCompleted
+	return isCloneTarget && !completedOrCopyCompleted
+}
+
+// isLinkedCloneNeedingSourceForRebuild returns true if v is a linked-clone volume
+// that has completed (or nearly completed) initial clone but is degraded and needs
+// its source volume attached for rebuild (the src replicas must be running).
+// isLinkedClonePotentiallyNeedingSource checks whether a volume is a linked-clone
+// of srcVolumeName that could have replicas needing a linked-clone rebuild.
+// The actual replica-level check is done separately by hasReplicasPendingLinkedCloneRebuild.
+func isLinkedClonePotentiallyNeedingSource(v *longhorn.Volume, srcVolumeName string) bool {
+	if v.Spec.CloneMode != longhorn.CloneModeLinkedClone {
+		return false
+	}
+	if types.IsLegacyLinkedCloneVolume(v) {
+		return false
+	}
+	if types.GetVolumeName(v.Spec.DataSource) != srcVolumeName {
+		return false
+	}
+	// Only applicable after initial clone (CopyCompletedAwaitingHealthy or Completed)
+	cloneState := v.Status.CloneStatus.State
+	if cloneState != longhorn.VolumeCloneStateCopyCompletedAwaitingHealthy &&
+		cloneState != longhorn.VolumeCloneStateCompleted {
+		return false
+	}
+	// Volume must be attached (rebuild only happens when attached)
+	if v.Status.State != longhorn.VolumeStateAttached {
+		return false
+	}
+	return true
+}
+
+func isVolumeFullyDetached(vol *longhorn.Volume) bool {
+	return vol.Spec.NodeID == "" &&
+		vol.Spec.MigrationNodeID == "" &&
+		vol.Status.CurrentMigrationNodeID == "" &&
+		vol.Status.State == longhorn.VolumeStateDetached
+}
+
+func createOrUpdateAttachmentTicket(va *longhorn.VolumeAttachment, ticketID, nodeID, disableFrontend string, attacherType longhorn.AttacherType) {
+	attachmentTicket, ok := va.Spec.AttachmentTickets[ticketID]
+	if !ok {
+		// Create new one
+		attachmentTicket = &longhorn.AttachmentTicket{
+			ID:     ticketID,
+			Type:   attacherType,
+			NodeID: nodeID,
+			Parameters: map[string]string{
+				longhorn.AttachmentParameterDisableFrontend: disableFrontend,
+			},
+		}
+	}
+	if attachmentTicket.NodeID != nodeID {
+		attachmentTicket.NodeID = nodeID
+	}
+	va.Spec.AttachmentTickets[attachmentTicket.ID] = attachmentTicket
+}
+
+func handleReconcileErrorLogging(logger logrus.FieldLogger, err error, mesg string) {
+	if types.ErrorIsInvalidState(err) {
+		logger.WithError(err).Trace(mesg)
+		return
+	}
+
+	if apierrors.IsConflict(err) {
+		logger.WithError(err).Warn(mesg)
+	} else {
+		logger.WithError(err).Error(mesg)
+	}
+}
+
+// r.Spec.FailedAt and r.Spec.LastFailedAt should both be set when a replica failure occurs.
+// r.Spec.FailedAt may be cleared (before rebuilding), but r.Spec.LastFailedAt must not be.
+func setReplicaFailedAt(r *longhorn.Replica, timestamp string) {
+	r.Spec.FailedAt = timestamp
+	if timestamp != "" {
+		r.Spec.LastFailedAt = timestamp
+	}
+}
+
+func isRegularRWXVolume(v *longhorn.Volume) bool {
+	if v == nil {
+		return false
+	}
+	return v.Spec.AccessMode == longhorn.AccessModeReadWriteMany && !v.Spec.Migratable
+}
+
+func checkIfRemoteDataCleanupIsNeeded(obj runtime.Object, bt *longhorn.BackupTarget) (bool, error) {
+	if obj == nil || bt == nil {
+		return false, nil
+	}
+	exists, err := datastore.IsLabelLonghornDeleteCustomResourceOnlyExisting(obj)
+	if err != nil {
+		return false, err
+	}
+
+	return !exists && isBackupTargetAvailable(bt), nil
+}
+
+// isBackupTargetAvailable returns a boolean that the backup target is available for true and not available for false
+func isBackupTargetAvailable(backupTarget *longhorn.BackupTarget) bool {
+	return backupTarget != nil &&
+		backupTarget.DeletionTimestamp == nil &&
+		backupTarget.Spec.BackupTargetURL != "" &&
+		backupTarget.Status.Available
+}
+
+// isSnapshotExistInEngine checks if a snapshot with the given name exists in the specified engine.
+// It returns true if the snapshot is found, otherwise false.
+func isSnapshotExistInEngine(snapshotName string, engine *longhorn.Engine) bool {
+	if engine == nil {
+		return false
+	}
+
+	if engine.Status.Snapshots == nil {
+		return false
+	}
+
+	for name := range engine.Status.Snapshots {
+		if name == snapshotName {
+			return true
+		}
+	}
+	return false
+}
+
+func newReplicaCR(v *longhorn.Volume, e *longhorn.Engine, hardNodeAffinity string) *longhorn.Replica {
+	return &longhorn.Replica{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            types.GenerateReplicaNameForVolume(v.Name),
+			OwnerReferences: datastore.GetOwnerReferencesForVolume(v),
+		},
+		Spec: longhorn.ReplicaSpec{
+			InstanceSpec: longhorn.InstanceSpec{
+				VolumeName:  v.Name,
+				VolumeSize:  v.Spec.Size,
+				Image:       v.Status.CurrentImage,
+				DataEngine:  v.Spec.DataEngine,
+				DesireState: longhorn.InstanceStateStopped,
+			},
+			EngineName:                       e.Name,
+			Active:                           true,
+			BackingImage:                     v.Spec.BackingImage,
+			HardNodeAffinity:                 hardNodeAffinity,
+			RevisionCounterDisabled:          v.Spec.RevisionCounterDisabled,
+			UnmapMarkDiskChainRemovedEnabled: e.Spec.UnmapMarkSnapChainRemovedEnabled,
+			SnapshotMaxCount:                 v.Spec.SnapshotMaxCount,
+			SnapshotMaxSize:                  v.Spec.SnapshotMaxSize,
+		},
+	}
+}
+
+func enqueueAfterDelay(queue workqueue.TypedRateLimitingInterface[any], obj interface{}, delay time.Duration) error {
+	key, err := controller.KeyFunc(obj)
+	if err != nil {
+		return errors.Wrapf(err, "couldn't get key for object %v", obj)
+	}
+	queue.AddAfter(key, delay)
+	return nil
+}
+
+// getAwsIAMRoleArnFromSecret retrieves the AWS IAM Role ARN from the specified secret in the given namespace.
+// returns the AWS IAM Role ARN string.
+func getAwsIAMRoleArnFromSecret(ds *datastore.DataStore, namespace, secretName string) (string, error) {
+	secret, err := ds.GetSecretRO(namespace, secretName)
+	if err != nil {
+		if apierrors.IsNotFound(err) {
+			return "", nil
+		}
+		return "", err
+	}
+
+	if secret == nil || secret.Data == nil {
+		return "", nil
+	}
+
+	if arn, ok := secret.Data[types.AWSIAMRoleArn]; ok {
+		return string(arn), nil
+	}
+	// Key not found; clear the annotation if needed.
+	return "", nil
+}
+
+func getCorrectedEncryptedVolumeSize(volumeSizeStr string, labels map[string]string) (string, error) {
+	if encrypted, exists := labels[types.LonghornLabelVolumeEncrypted]; exists && encrypted == types.LonghornLabelValueEnabled {
+		volumeSize, err := strconv.ParseInt(volumeSizeStr, 10, 64)
+		if err != nil {
+			return "", errors.Wrapf(err, "failed to convert volume size: %v", volumeSizeStr)
+		}
+		correctedSize := volumeSize - lhtypes.Luks2EncryptionHeaderSize
+		if correctedSize < 0 {
+			return "", errors.Errorf("corrected volume size is negative: %d", correctedSize)
+		}
+		return strconv.FormatInt(correctedSize, 10), nil
+	}
+	return volumeSizeStr, nil
+}
+
+func isRevisionedEngineImage(image string) bool {
+	lastSlashIndex := strings.LastIndex(image, "/")
+	lastColonIndex := strings.LastIndex(image, ":")
+	if lastColonIndex <= lastSlashIndex {
+		return false
+	}
+
+	tag := image[lastColonIndex+1:]
+	return engineImageRevisionTagRegex.MatchString(tag)
+}
+
+// getContainerArgValue returns the value following the given flag in a container's
+// args (e.g. for flag "--spdk-iobuf-large-pool-size" it returns the next element).
+// It returns an empty string if the flag is absent or has no following value.
+func getContainerArgValue(args []string, flag string) string {
+	for i, arg := range args {
+		if arg == flag && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
+
+func isMigrationBlockedByEngine(e *longhorn.Engine) (blocked bool, reason string) {
+	var pending []string
+	for replicaName := range e.Spec.ReplicaAddressMap {
+		mode := e.Status.ReplicaModeMap[replicaName]
+		if mode == "" || mode == longhorn.ReplicaModeWO {
+			pending = append(pending, replicaName)
+		}
+	}
+	if len(pending) > 0 {
+		sort.Strings(pending)
+		return true, fmt.Sprintf("replicas %v of engine %v are pending or in rebuilding", pending, e.Name)
+	}
+	for _, status := range e.Status.PurgeStatus {
+		if status.IsPurging {
+			return true, fmt.Sprintf("snapshot purge is in progress for engine %v", e.Name)
+		}
+	}
+	return false, ""
+}
